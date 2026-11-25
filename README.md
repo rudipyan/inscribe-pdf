@@ -173,10 +173,28 @@ plugin patches one internal viewer method (restored on unload) and reads the vie
 internal PDF.js objects. An Obsidian update can break these integration points; the
 plugin fails loudly with a clear message rather than misbehaving silently.
 
+## Installation
+
+Disable the original **Study PDF** plugin before enabling **Inscribe PDF** under Community
+Plugins so both plugins do not install PDF viewer hooks at the same time.
+
+### Via BRAT (automatic updates)
+
+1. Install the **BRAT** community plugin in Obsidian and enable it.
+2. Open **Settings → BRAT → Add Beta plugin**.
+3. Enter `https://github.com/rudipyan/inscribe-pdf` and add the plugin.
+4. Enable **Inscribe PDF** under **Settings → Community Plugins**.
+
+### Manual installation
+
+Download `main.js`, `manifest.json`, and `styles.css` from the
+[latest GitHub Release](https://github.com/rudipyan/inscribe-pdf/releases/latest), copy
+them into `<vault>/.obsidian/plugins/inscribe-pdf/`, reload Obsidian, and enable **Inscribe PDF**.
+
 ## Development
 
-This private fork is intended for local use and is not published to the Obsidian
-Community Plugins directory.
+Inscribe PDF is distributed via GitHub Releases and BRAT rather than the Obsidian Community
+Plugins directory.
 
 ```bash
 npm ci
