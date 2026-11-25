@@ -3,14 +3,15 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { PDFDocument, PDFName, PDFArray, PDFRawStream, PDFString, EncryptedPDFError } from '@cantoo/pdf-lib';
 import {
-	addHighlightAnnotation,
-	removeHighlightsAt,
-	hasHighlightAt,
-	inspectHighlightAt,
+	addHighlightAnnotations,
 	buildHighlightIndex,
-	findHighlightInIndex,
-	setHighlightNoteAt,
+	findHighlightsInIndexAtPoint,
 	getStoredQuotes,
+	removeHighlightForTarget,
+	replaceOverlappingHighlightAnnotations,
+	setHighlightColorAt,
+	setHighlightNoteForTarget,
+	type AddHighlightOptions,
 } from '../src/annotate';
 import { makeFixturePdfBytes, makeEncryptedFixturePdfBytes, loadPdfjsDoc } from './helpers/pdf-fixture';
 import {
@@ -21,6 +22,11 @@ import {
 	FORM_FIELD_VALUE,
 	PAGE_2_TEXT,
 } from './helpers/complex-fixture';
+
+const addHighlightAnnotation = (bytes: Uint8Array, options: AddHighlightOptions) =>
+	addHighlightAnnotations(bytes, [options]);
+const inspectHighlightAtPoint = async (bytes: Uint8Array, pageIndex: number, point: { x: number; y: number }) =>
+	findHighlightsInIndexAtPoint(await buildHighlightIndex(bytes), pageIndex, point)[0] ?? null;
 
 const YELLOW = { r: 1, g: 0.92, b: 0.2 };
 
@@ -103,6 +109,59 @@ describe('addHighlightAnnotation', () => {
 		await expect(
 			addHighlightAnnotation(bytes, { pageIndex: 0, quadPoints: [], box: { left: 0, right: 1, top: 1, bottom: 0 }, color: YELLOW }),
 		).rejects.toThrow(/multiple of 8/);
+	});
+
+	it.each(['direct', 'indirect'] as const)('appends to an existing %s /Annots array', async (storage) => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const annots = doc.context.obj([]);
+		const page = doc.getPage(0);
+		page.node.set(PDFName.of('Annots'), storage === 'indirect' ? doc.context.register(annots) : annots);
+		const seeded = await doc.save();
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		const result = await addHighlightAnnotation(seeded, {
+			pageIndex: 0,
+			quadPoints: [0, 10, 10, 10, 0, 0, 10, 0],
+			box,
+			color: YELLOW,
+		});
+
+		const saved = await PDFDocument.load(result);
+		expect(saved.getPage(0).node.lookupMaybe(PDFName.of('Annots'), PDFArray)?.size()).toBe(1);
+	});
+
+	it('rejects a direct dictionary at /Annots before saving over it', async () => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const page = doc.getPage(0);
+		const originalValue = doc.context.obj({ Type: 'Annot', Subtype: 'Link' });
+		page.node.set(PDFName.of('Annots'), originalValue);
+		const save = vi.spyOn(doc, 'save');
+		vi.spyOn(PDFDocument, 'load').mockResolvedValue(doc);
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		await expect(addHighlightAnnotation(new Uint8Array([1]), {
+			pageIndex: 0, quadPoints: [0, 10, 10, 10, 0, 0, 10, 0], box, color: YELLOW,
+		})).rejects.toThrow(/unreadable \/Annots array; highlight was not saved/);
+
+		expect(page.node.get(PDFName.of('Annots'))).toBe(originalValue);
+		expect(save).not.toHaveBeenCalled();
+	});
+
+	it('rejects an unresolved indirect /Annots reference without replacing it', async () => {
+		const doc = await PDFDocument.load(await makeFixturePdfBytes());
+		const page = doc.getPage(0);
+		const originalValue = doc.context.nextRef();
+		page.node.set(PDFName.of('Annots'), originalValue);
+		const save = vi.spyOn(doc, 'save');
+		vi.spyOn(PDFDocument, 'load').mockResolvedValue(doc);
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
+
+		await expect(addHighlightAnnotation(new Uint8Array([1]), {
+			pageIndex: 0, quadPoints: [0, 10, 10, 10, 0, 0, 10, 0], box, color: YELLOW,
+		})).rejects.toThrow(/unreadable \/Annots array; highlight was not saved/);
+
+		expect(page.node.get(PDFName.of('Annots'))).toBe(originalValue);
+		expect(save).not.toHaveBeenCalled();
 	});
 
 	it('produces a PDF whose page has a real, renderable /Highlight annotation (tiny fixture round-trip)', async () => {
@@ -285,7 +344,7 @@ describe('addHighlightAnnotation', () => {
 		expect(highlights).toHaveLength(1);
 	});
 
-	it('draws one appearance rect per quad, not one rect over the whole union box (multi-line safety)', async () => {
+	it('draws one polygon path per quad, not one shape over the whole union box (multi-line safety)', async () => {
 		// Two disjoint quads (as a two-line selection with a gap would produce).
 		// The union box spans the gap; the appearance stream must not fill it.
 		const bytes = await makeFixturePdfBytes();
@@ -298,8 +357,8 @@ describe('addHighlightAnnotation', () => {
 		const highlighted = await addHighlightAnnotation(bytes, { pageIndex: 0, quadPoints, box, color: YELLOW });
 
 		// Read the /AP stream's actual content back out via pdf-lib and confirm it
-		// contains two separate `re` (rectangle) fills -- not one rect spanning the
-		// full union-box height, which would paint over the gap between the lines.
+		// contains two separate polygon paths, not one shape spanning the full
+		// union-box height, which would paint over the gap between the lines.
 		const reloaded = await PDFDocument.load(highlighted);
 		const page = reloaded.getPage(0);
 		const annots = page.node.lookupMaybe(PDFName.of('Annots'), PDFArray)!;
@@ -308,9 +367,37 @@ describe('addHighlightAnnotation', () => {
 		const ap = reloaded.context.lookup(annotDict.get(PDFName.of('AP'))) as any; // eslint-disable-line @typescript-eslint/no-explicit-any
 		const apStream = reloaded.context.lookup(ap.get(PDFName.of('N'))) as PDFRawStream;
 		const content = apStream.getContentsString();
-		const reCount = (content.match(/ re\b/g) ?? []).length;
+		const moveCount = (content.match(/ m\b/g) ?? []).length;
 
-		expect(reCount).toBe(2);
+		expect(moveCount).toBe(2);
+		expect(content).not.toContain(' re');
+	});
+});
+
+describe('recolor preserves the PDF.js annotation identity', () => {
+	it('keeps the same PDF.js annotation id after two color changes', async () => {
+		const box = { left: 50, right: 150, top: 220, bottom: 200 };
+		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
+		const bytes = await addHighlightAnnotation(await makeFixturePdfBytes(), {
+			pageIndex: 0, quadPoints: quad, box, color: YELLOW, quote: 'stable identity',
+		});
+		const beforePdfjs = await loadPdfjsDoc(bytes);
+		const beforeAnnotations = await (await beforePdfjs.getPage(1)).getAnnotations();
+		const beforeId = beforeAnnotations.find((annotation: { subtype: string }) => annotation.subtype === 'Highlight')!.id;
+		const inspected = await inspectHighlightAtPoint(bytes, 0, { x: 100, y: 210 });
+		if (!inspected?.target) throw new Error('Fixture highlight did not expose an indirect recolor target.');
+		const firstRecolor = await setHighlightColorAt(bytes, {
+			...inspected.target,
+			color: { r: 0.12, g: 0.34, b: 0.78 },
+		});
+		const secondRecolor = await setHighlightColorAt(firstRecolor.bytes, {
+			...firstRecolor.target,
+			color: YELLOW,
+		});
+		const afterPdfjs = await loadPdfjsDoc(secondRecolor.bytes);
+		const afterAnnotations = await (await afterPdfjs.getPage(1)).getAnnotations();
+		const afterId = afterAnnotations.find((annotation: { subtype: string }) => annotation.subtype === 'Highlight')!.id;
+		expect(afterId).toBe(beforeId);
 	});
 });
 
@@ -396,7 +483,7 @@ describe('captured quote (custom StudyPDFQuote key)', () => {
 		expect((await getStoredQuotes(highlighted)).get(0)).toEqual(['cañón, café']);
 	});
 
-	it('survives setHighlightNoteAt re-saving the document (adding a note keeps the stored quote)', async () => {
+	it('survives setHighlightNoteForTarget re-saving the document (adding a note keeps the stored quote)', async () => {
 		const bytes = await makeFixturePdfBytes();
 		const box = { left: 10, right: 100, top: 220, bottom: 200 };
 		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
@@ -408,9 +495,9 @@ describe('captured quote (custom StudyPDFQuote key)', () => {
 			quote: 'the highlighted phrase',
 		});
 
-		const noted = await setHighlightNoteAt(highlighted, {
-			pageIndex: 0,
-			box: { left: 50, right: 50, top: 210, bottom: 210 },
+		const target = (await inspectHighlightAtPoint(highlighted, 0, { x: 50, y: 210 }))!.target!;
+		const noted = await setHighlightNoteForTarget(highlighted, {
+			...target,
 			note: 'a study note',
 		});
 		expect(noted.updatedCount).toBe(1);
@@ -445,7 +532,7 @@ describe('captured quote (custom StudyPDFQuote key)', () => {
 	});
 });
 
-describe('removeHighlightsAt', () => {
+describe('removeHighlightForTarget', () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -457,7 +544,7 @@ describe('removeHighlightsAt', () => {
 		return annotations.filter((a: { subtype: string }) => a.subtype === 'Highlight').length;
 	}
 
-	it('removes only the highlight overlapping the given box, leaving others intact', async () => {
+	it('removes only the targeted highlight, leaving others intact', async () => {
 		const base = await makeFixturePdfBytes();
 		const box1 = { left: 10, right: 100, top: 220, bottom: 200 };
 		const quad1 = [box1.left, box1.top, box1.right, box1.top, box1.left, box1.bottom, box1.right, box1.bottom];
@@ -469,8 +556,8 @@ describe('removeHighlightsAt', () => {
 
 		expect(await countHighlights(withBoth, 0)).toBe(2);
 
-		// A selection box overlapping only the second highlight's region.
-		const result = await removeHighlightsAt(withBoth, { pageIndex: 0, box: { left: 10, right: 100, top: 150, bottom: 130 } });
+		const target = (await inspectHighlightAtPoint(withBoth, 0, { x: 50, y: 140 }))!.target!;
+		const result = await removeHighlightForTarget(withBoth, target);
 
 		expect(result.removedCount).toBe(1);
 		expect(await countHighlights(result.bytes, 0)).toBe(1);
@@ -482,7 +569,7 @@ describe('removeHighlightsAt', () => {
 		expect(remaining[0].rect).toEqual([box1.left, box1.bottom, box1.right, box1.top]);
 	});
 
-	it('never removes non-Highlight annotations, even ones overlapping the box', async () => {
+	it('never removes non-Highlight annotations when replacing overlapping annotations', async () => {
 		const base = await makeFixturePdfBytes();
 		const doc = await PDFDocument.load(base);
 		const context = doc.context;
@@ -490,45 +577,53 @@ describe('removeHighlightsAt', () => {
 		const linkDict = context.obj({
 			Type: 'Annot',
 			Subtype: 'Link',
-			Rect: [10, 130, 100, 220], // overlaps the box we'll pass to removeHighlightsAt
+			Rect: [10, 130, 100, 220], // overlaps the box we'll pass to replaceOverlappingHighlightAnnotations
 			Border: [0, 0, 0],
 			A: { Type: 'Action', S: 'URI', URI: PDFString.of('https://example.com') },
 		});
 		page.node.set(PDFName.of('Annots'), context.obj([context.register(linkDict)]));
 		const bytesWithLink = await doc.save();
 
-		const result = await removeHighlightsAt(bytesWithLink, {
+		const box = { left: 10, right: 100, top: 220, bottom: 130 };
+		const result = await replaceOverlappingHighlightAnnotations(bytesWithLink, [{
 			pageIndex: 0,
-			box: { left: 10, right: 100, top: 220, bottom: 130 },
-		});
+			quadPoints: [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom],
+			box,
+			color: YELLOW,
+		}]);
 
-		expect(result.removedCount).toBe(0);
-		const afterDoc = await PDFDocument.load(result.bytes);
+		const afterDoc = await PDFDocument.load(result);
 		const annots = afterDoc.getPage(0).node.lookupMaybe(PDFName.of('Annots'), PDFArray);
-		expect(annots?.size()).toBe(1); // the Link annotation is untouched
+		expect(annots?.size()).toBe(2); // the Link annotation is untouched and new highlight added
 	});
 
-	it('is a no-op (and returns the original bytes) when nothing overlaps', async () => {
+	it('keeps existing highlights when replacing annotations that do not overlap', async () => {
 		const base = await makeFixturePdfBytes();
 		const box = { left: 10, right: 100, top: 220, bottom: 200 };
 		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
 		const withHighlight = await addHighlightAnnotation(base, { pageIndex: 0, quadPoints: quad, box, color: YELLOW });
 
-		const result = await removeHighlightsAt(withHighlight, {
+		const boxFar = { left: 500, right: 600, top: 50, bottom: 0 };
+		const result = await replaceOverlappingHighlightAnnotations(withHighlight, [{
 			pageIndex: 0,
-			box: { left: 500, right: 600, top: 50, bottom: 0 }, // far away, no overlap
-		});
+			quadPoints: [boxFar.left, boxFar.top, boxFar.right, boxFar.top, boxFar.left, boxFar.bottom, boxFar.right, boxFar.bottom],
+			box: boxFar,
+			color: YELLOW,
+		}]);
 
-		expect(result.removedCount).toBe(0);
-		expect(result.bytes).toBe(withHighlight); // same reference: genuinely a no-op
-		expect(await countHighlights(result.bytes, 0)).toBe(1);
+		expect(await countHighlights(result, 0)).toBe(2);
 	});
 
-	it('is a no-op when the page has no annotations at all', async () => {
+	it('adds highlights on a page with no annotations at all', async () => {
 		const base = await makeFixturePdfBytes();
-		const result = await removeHighlightsAt(base, { pageIndex: 0, box: { left: 0, right: 100, top: 100, bottom: 0 } });
-		expect(result.removedCount).toBe(0);
-		expect(result.bytes).toBe(base);
+		const box = { left: 0, right: 100, top: 100, bottom: 0 };
+		const result = await replaceOverlappingHighlightAnnotations(base, [{
+			pageIndex: 0,
+			quadPoints: [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom],
+			box,
+			color: YELLOW,
+		}]);
+		expect(await countHighlights(result, 0)).toBe(1);
 	});
 
 	it('removes a highlight from an owner-password-encrypted PDF', async () => {
@@ -547,23 +642,27 @@ describe('removeHighlightsAt', () => {
 		const encrypted = await doc.save();
 		await expect(PDFDocument.load(encrypted)).rejects.toThrow(EncryptedPDFError);
 
-		const result = await removeHighlightsAt(encrypted, {
-			pageIndex: 0,
-			box: { left: 50, right: 50, top: 210, bottom: 210 },
-		});
+		const target = (await inspectHighlightAtPoint(encrypted, 0, { x: 50, y: 210 }))!.target!;
+		const result = await removeHighlightForTarget(encrypted, target);
 		expect(result.removedCount).toBe(1);
 		expect(await countHighlights(result.bytes, 0)).toBe(0);
 	});
 
 	it('fails fast with a clear message on a PDF that genuinely requires a password to open', async () => {
 		const bytes = await makeEncryptedFixturePdfBytes({ userPassword: 'open-secret' });
+		const box = { left: 0, right: 10, top: 10, bottom: 0 };
 		await expect(
-			removeHighlightsAt(bytes, { pageIndex: 0, box: { left: 0, right: 10, top: 10, bottom: 0 } }),
+			replaceOverlappingHighlightAnnotations(bytes, [{
+				pageIndex: 0,
+				quadPoints: [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom],
+				box,
+				color: YELLOW,
+			}]),
 		).rejects.toThrow(/password/i);
 	});
 });
 
-describe('hasHighlightAt', () => {
+describe('hasHighlightAt / inspectHighlightAtPoint', () => {
 	afterEach(() => {
 		vi.restoreAllMocks();
 	});
@@ -574,13 +673,13 @@ describe('hasHighlightAt', () => {
 		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
 		const withHighlight = await addHighlightAnnotation(base, { pageIndex: 0, quadPoints: quad, box, color: YELLOW });
 
-		expect(await hasHighlightAt(withHighlight, { pageIndex: 0, box: { left: 50, right: 50, top: 210, bottom: 210 } })).toBe(true);
-		expect(await hasHighlightAt(withHighlight, { pageIndex: 0, box: { left: 500, right: 500, top: 10, bottom: 10 } })).toBe(false);
+		expect(await inspectHighlightAtPoint(withHighlight, 0, { x: 50, y: 210 })).not.toBeNull();
+		expect(await inspectHighlightAtPoint(withHighlight, 0, { x: 500, y: 10 })).toBeNull();
 	});
 
 	it('is false on a page with no annotations at all (no error)', async () => {
 		const base = await makeFixturePdfBytes();
-		expect(await hasHighlightAt(base, { pageIndex: 0, box: { left: 0, right: 10, top: 10, bottom: 0 } })).toBe(false);
+		expect(await inspectHighlightAtPoint(base, 0, { x: 0, y: 10 })).toBeNull();
 	});
 
 	it('ignores non-Highlight annotations', async () => {
@@ -598,13 +697,13 @@ describe('hasHighlightAt', () => {
 		page.node.set(PDFName.of('Annots'), context.obj([context.register(linkDict)]));
 		const bytesWithLink = await doc.save();
 
-		expect(await hasHighlightAt(bytesWithLink, { pageIndex: 0, box: { left: 50, right: 50, top: 150, bottom: 150 } })).toBe(false);
+		expect(await inspectHighlightAtPoint(bytesWithLink, 0, { x: 50, y: 150 })).toBeNull();
 	});
 
 	it('does not modify the PDF (read-only)', async () => {
 		const base = await makeFixturePdfBytes();
-		await hasHighlightAt(base, { pageIndex: 0, box: { left: 0, right: 10, top: 10, bottom: 0 } });
-		// base is a fresh Uint8Array from pdf-lib's own save(); if hasHighlightAt
+		await inspectHighlightAtPoint(base, 0, { x: 0, y: 10 });
+		// base is a fresh Uint8Array from pdf-lib's own save(); if inspectHighlightAtPoint
 		// mutated the loaded doc and (incorrectly) saved it back to this reference,
 		// this would catch it. Since it never calls .save(), this just documents
 		// the read-only contract explicitly rather than relying on code review.
@@ -614,14 +713,14 @@ describe('hasHighlightAt', () => {
 
 	it('reads an owner-password-encrypted PDF without error', async () => {
 		const bytes = await makeEncryptedFixturePdfBytes();
-		expect(await hasHighlightAt(bytes, { pageIndex: 0, box: { left: 0, right: 10, top: 10, bottom: 0 } })).toBe(false);
+		expect(await inspectHighlightAtPoint(bytes, 0, { x: 0, y: 10 })).toBeNull();
 	});
 });
 
 describe('highlight notes (annotation /Contents)', () => {
 	const box = { left: 10, right: 100, top: 220, bottom: 200 };
 	const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
-	const point = { left: 50, right: 50, top: 210, bottom: 210 };
+	const point = { x: 50, y: 210 };
 
 	async function makeHighlightedBytes(): Promise<Uint8Array> {
 		return addHighlightAnnotation(await makeFixturePdfBytes(), {
@@ -635,7 +734,8 @@ describe('highlight notes (annotation /Contents)', () => {
 	it('sets a note that PDF.js (and Adobe) expose as the annotation comment, with unicode intact', async () => {
 		const highlighted = await makeHighlightedBytes();
 		const note = 'Repasar para el examen: cañón, café';
-		const result = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: point, note });
+		const target = (await inspectHighlightAtPoint(highlighted, 0, point))!.target!;
+		const result = await setHighlightNoteForTarget(highlighted, { ...target, note });
 		expect(result.updatedCount).toBe(1);
 
 		const pdfjsDoc = await loadPdfjsDoc(result.bytes);
@@ -644,50 +744,54 @@ describe('highlight notes (annotation /Contents)', () => {
 		expect(annots).toHaveLength(1);
 		expect(annots[0].contentsObj.str).toBe(note);
 
-		expect(await inspectHighlightAt(result.bytes, { pageIndex: 0, box: point })).toEqual({ note });
+		expect(await inspectHighlightAtPoint(result.bytes, 0, point)).toMatchObject({ note });
 	});
 
 	it('replaces an existing note when set again', async () => {
 		const highlighted = await makeHighlightedBytes();
-		const first = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: point, note: 'first' });
-		const second = await setHighlightNoteAt(first.bytes, { pageIndex: 0, box: point, note: 'second' });
+		const target1 = (await inspectHighlightAtPoint(highlighted, 0, point))!.target!;
+		const first = await setHighlightNoteForTarget(highlighted, { ...target1, note: 'first' });
+		const second = await setHighlightNoteForTarget(first.bytes, { ...first.target, note: 'second' });
 		expect(second.updatedCount).toBe(1);
-		expect(await inspectHighlightAt(second.bytes, { pageIndex: 0, box: point })).toEqual({ note: 'second' });
+		expect(await inspectHighlightAtPoint(second.bytes, 0, point)).toMatchObject({ note: 'second' });
 	});
 
 	it('removes the note (but keeps the highlight) when set to empty/whitespace', async () => {
 		const highlighted = await makeHighlightedBytes();
-		const noted = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: point, note: 'temp' });
-		const cleared = await setHighlightNoteAt(noted.bytes, { pageIndex: 0, box: point, note: '   ' });
+		const target = (await inspectHighlightAtPoint(highlighted, 0, point))!.target!;
+		const noted = await setHighlightNoteForTarget(highlighted, { ...target, note: 'temp' });
+		const cleared = await setHighlightNoteForTarget(noted.bytes, { ...noted.target, note: '   ' });
 		expect(cleared.updatedCount).toBe(1);
-		expect(await inspectHighlightAt(cleared.bytes, { pageIndex: 0, box: point })).toEqual({ note: null });
-		expect(await hasHighlightAt(cleared.bytes, { pageIndex: 0, box: point })).toBe(true);
+		expect(await inspectHighlightAtPoint(cleared.bytes, 0, point)).toMatchObject({ note: null });
+		expect(await inspectHighlightAtPoint(cleared.bytes, 0, point)).not.toBeNull();
 	});
 
-	it('is a no-op (original bytes back) when no highlight is under the box', async () => {
-		const base = await makeFixturePdfBytes();
-		const result = await setHighlightNoteAt(base, { pageIndex: 0, box: point, note: 'nope' });
-		expect(result.updatedCount).toBe(0);
-		expect(result.bytes).toBe(base);
-	});
-
-	it('inspectHighlightAt: null when no highlight, note null when highlight has no note', async () => {
-		const base = await makeFixturePdfBytes();
-		expect(await inspectHighlightAt(base, { pageIndex: 0, box: point })).toBeNull();
+	it('is a no-op (original bytes back) when same note is set', async () => {
 		const highlighted = await makeHighlightedBytes();
-		expect(await inspectHighlightAt(highlighted, { pageIndex: 0, box: point })).toEqual({ note: null });
+		const target = (await inspectHighlightAtPoint(highlighted, 0, point))!.target!;
+		const noted = await setHighlightNoteForTarget(highlighted, { ...target, note: 'same' });
+		const noop = await setHighlightNoteForTarget(noted.bytes, { ...noted.target, note: 'same' });
+		expect(noop.updatedCount).toBe(0);
+		expect(noop.bytes).toBe(noted.bytes);
+	});
+
+	it('inspectHighlightAtPoint: null when no highlight, note null when highlight has no note', async () => {
+		const base = await makeFixturePdfBytes();
+		expect(await inspectHighlightAtPoint(base, 0, point)).toBeNull();
+		const highlighted = await makeHighlightedBytes();
+		expect(await inspectHighlightAtPoint(highlighted, 0, point)).toMatchObject({ note: null });
 	});
 
 	it('fails fast with a clear message on a PDF that genuinely requires a password to open', async () => {
 		const bytes = await makeEncryptedFixturePdfBytes({ userPassword: 'open-secret' });
 		await expect(
-			hasHighlightAt(bytes, { pageIndex: 0, box: { left: 0, right: 10, top: 10, bottom: 0 } }),
+			inspectHighlightAtPoint(bytes, 0, { x: 0, y: 10 }),
 		).rejects.toThrow(/password/i);
 	});
 });
 
 /** The index exists purely as a faster path to the same answer, so the
- * contract that matters is agreement with inspectHighlightAt -- not any
+ * contract that matters is agreement with inspectHighlightAtPoint -- not any
  * particular index shape. Swept over a grid rather than a few hand-picked
  * points so an off-by-one in the box comparison can't hide between samples. */
 async function expectAgreementAcrossGrid(bytes: Uint8Array, pageCount = 1) {
@@ -699,9 +803,9 @@ async function expectAgreementAcrossGrid(bytes: Uint8Array, pageCount = 1) {
 	for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
 		for (let x = 5; x <= 600; x += 15) {
 			for (let y = 5; y <= 800; y += 15) {
-				const box = { left: x, right: x, top: y, bottom: y };
-				const direct = await inspectHighlightAt(bytes, { pageIndex, box });
-				expect(findHighlightInIndex(index, { pageIndex, box })).toEqual(direct);
+				const point = { x, y };
+				const direct = await inspectHighlightAtPoint(bytes, pageIndex, point);
+				expect(findHighlightsInIndexAtPoint(index, pageIndex, point)[0] ?? null).toEqual(direct);
 				if (direct) sawHighlight = true;
 				else sawEmpty = true;
 			}
@@ -712,8 +816,8 @@ async function expectAgreementAcrossGrid(bytes: Uint8Array, pageCount = 1) {
 	expect(sawEmpty).toBe(true);
 }
 
-describe('buildHighlightIndex / findHighlightInIndex', () => {
-	it('agrees with inspectHighlightAt everywhere on a highlighted page', async () => {
+describe('buildHighlightIndex / findHighlightsInIndexAtPoint', () => {
+	it('agrees with inspectHighlightAtPoint everywhere on a highlighted page', async () => {
 		const base = await makeFixturePdfBytes();
 		const box = { left: 10, right: 100, top: 220, bottom: 200 };
 		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
@@ -727,28 +831,29 @@ describe('buildHighlightIndex / findHighlightInIndex', () => {
 		const box = { left: 10, right: 100, top: 220, bottom: 200 };
 		const quad = [box.left, box.top, box.right, box.top, box.left, box.bottom, box.right, box.bottom];
 		const highlighted = await addHighlightAnnotation(base, { pageIndex: 0, quadPoints: quad, box, color: YELLOW });
-		const withNote = await setHighlightNoteAt(highlighted, { pageIndex: 0, box: { left: 50, right: 50, top: 210, bottom: 210 }, note: 'hello' });
+		const target = (await inspectHighlightAtPoint(highlighted, 0, { x: 50, y: 210 }))!.target!;
+		const withNote = await setHighlightNoteForTarget(highlighted, { ...target, note: 'hello' });
 
-		const point = { left: 50, right: 50, top: 210, bottom: 210 };
-		expect(findHighlightInIndex(await buildHighlightIndex(withNote.bytes), { pageIndex: 0, box: point })).toEqual({
+		const point = { x: 50, y: 210 };
+		expect(findHighlightsInIndexAtPoint(await buildHighlightIndex(withNote.bytes), 0, point)[0]).toMatchObject({
 			note: 'hello',
 		});
 		await expectAgreementAcrossGrid(withNote.bytes);
 	});
 
-	it('returns null for a page with no highlights, like inspectHighlightAt', async () => {
+	it('returns null for a page with no highlights, like inspectHighlightAtPoint', async () => {
 		const base = await makeFixturePdfBytes();
 		const index = await buildHighlightIndex(base);
-		const point = { left: 50, right: 50, top: 210, bottom: 210 };
+		const point = { x: 50, y: 210 };
 
-		expect(findHighlightInIndex(index, { pageIndex: 0, box: point })).toBeNull();
-		expect(await inspectHighlightAt(base, { pageIndex: 0, box: point })).toBeNull();
+		expect(findHighlightsInIndexAtPoint(index, 0, point)[0] ?? null).toBeNull();
+		expect(await inspectHighlightAtPoint(base, 0, point)).toBeNull();
 	});
 
-	it('returns null for an out-of-range page instead of throwing', async () => {
+	it('returns empty for an out-of-range page instead of throwing', async () => {
 		const index = await buildHighlightIndex(await makeFixturePdfBytes());
 
-		expect(findHighlightInIndex(index, { pageIndex: 99, box: { left: 0, right: 0, top: 0, bottom: 0 } })).toBeNull();
+		expect(findHighlightsInIndexAtPoint(index, 99, { x: 0, y: 0 })).toEqual([]);
 	});
 
 	it('ignores non-highlight annotations, like the direct lookup', async () => {
@@ -765,10 +870,10 @@ describe('buildHighlightIndex / findHighlightInIndex', () => {
 		});
 		doc.getPage(0).node.set(PDFName.of('Annots'), context.obj([context.register(linkDict)]));
 		const bytesWithLink = await doc.save();
-		const point = { left: 50, right: 50, top: 150, bottom: 150 };
+		const point = { x: 50, y: 150 };
 
-		expect(findHighlightInIndex(await buildHighlightIndex(bytesWithLink), { pageIndex: 0, box: point })).toBeNull();
-		expect(await inspectHighlightAt(bytesWithLink, { pageIndex: 0, box: point })).toBeNull();
+		expect(findHighlightsInIndexAtPoint(await buildHighlightIndex(bytesWithLink), 0, point)[0] ?? null).toBeNull();
+		expect(await inspectHighlightAtPoint(bytesWithLink, 0, point)).toBeNull();
 	});
 
 	it('agrees across every page of the complex fixture', async () => {
@@ -783,19 +888,19 @@ describe('buildHighlightIndex / findHighlightInIndex', () => {
 		// Explicit hit at the highlight's centre: a grid coarse enough to keep this
 		// test fast steps straight over a 20pt-tall band, so the sweep below proves
 		// agreement but cannot prove the highlight was ever found.
-		const centre = { left: 100, right: 100, top: 390, bottom: 390 };
-		expect(await inspectHighlightAt(bytes, { pageIndex: 1, box: centre })).toEqual({ note: null });
-		expect(findHighlightInIndex(index, { pageIndex: 1, box: centre })).toEqual({ note: null });
+		const centre = { x: 100, y: 390 };
+		expect(await inspectHighlightAtPoint(bytes, 1, centre)).toMatchObject({ note: null });
+		expect(findHighlightsInIndexAtPoint(index, 1, centre)[0]).toMatchObject({ note: null });
 		// ...and the highlight must not bleed onto its neighbours.
-		expect(findHighlightInIndex(index, { pageIndex: 0, box: centre })).toBeNull();
-		expect(findHighlightInIndex(index, { pageIndex: 2, box: centre })).toBeNull();
+		expect(findHighlightsInIndexAtPoint(index, 0, centre)[0] ?? null).toBeNull();
+		expect(findHighlightsInIndexAtPoint(index, 2, centre)[0] ?? null).toBeNull();
 
 		for (let pageIndex = 0; pageIndex < COMPLEX_FIXTURE_PAGE_COUNT; pageIndex++) {
 			for (let x = 5; x <= 600; x += 25) {
 				for (let y = 5; y <= 800; y += 25) {
-					const probe = { left: x, right: x, top: y, bottom: y };
-					expect(findHighlightInIndex(index, { pageIndex, box: probe })).toEqual(
-						await inspectHighlightAt(bytes, { pageIndex, box: probe }),
+					const probe = { x, y };
+					expect(findHighlightsInIndexAtPoint(index, pageIndex, probe)[0] ?? null).toEqual(
+						await inspectHighlightAtPoint(bytes, pageIndex, probe),
 					);
 				}
 			}
@@ -823,7 +928,7 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 		box: { left: 200, right: 300, top: 192, bottom: 180 },
 	};
 	/** Inside WRAPPED's /Rect, but only on NEXT_SENTENCE's quad. */
-	const CLICK = { left: 250, right: 250, top: 186, bottom: 186 };
+	const CLICK = { x: 250, y: 186 };
 
 	async function makeTwoHighlights() {
 		let bytes = await addHighlightAnnotation(await makeFixturePdfBytes(), {
@@ -850,7 +955,8 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 	it('a note set by clicking one highlight does not land on its neighbour', async () => {
 		const bytes = await makeTwoHighlights();
 
-		const result = await setHighlightNoteAt(bytes, { pageIndex: 0, box: CLICK, note: 'about the next sentence' });
+		const target = (await inspectHighlightAtPoint(bytes, 0, CLICK))!.target!;
+		const result = await setHighlightNoteForTarget(bytes, { ...target, note: 'about the next sentence' });
 
 		expect(result.updatedCount).toBe(1);
 		expect(await readNotes(result.bytes)).toEqual([null, 'about the next sentence']);
@@ -858,15 +964,16 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 
 	it('reads back the clicked highlight\'s own note, not the neighbour\'s', async () => {
 		let bytes = await makeTwoHighlights();
-		bytes = (await setHighlightNoteAt(bytes, {
-			pageIndex: 0,
-			box: { left: 60, right: 60, top: 206, bottom: 206 },
+		const wrappedTarget = (await inspectHighlightAtPoint(bytes, 0, { x: 60, y: 206 }))!.target!;
+		bytes = (await setHighlightNoteForTarget(bytes, {
+			...wrappedTarget,
 			note: 'about the wrapped sentence',
 		})).bytes;
-		bytes = (await setHighlightNoteAt(bytes, { pageIndex: 0, box: CLICK, note: 'about the next sentence' })).bytes;
+		const nextTarget = (await inspectHighlightAtPoint(bytes, 0, CLICK))!.target!;
+		bytes = (await setHighlightNoteForTarget(bytes, { ...nextTarget, note: 'about the next sentence' })).bytes;
 
-		expect(await inspectHighlightAt(bytes, { pageIndex: 0, box: CLICK })).toEqual({ note: 'about the next sentence' });
-		expect(findHighlightInIndex(await buildHighlightIndex(bytes), { pageIndex: 0, box: CLICK })).toEqual({
+		expect(await inspectHighlightAtPoint(bytes, 0, CLICK)).toMatchObject({ note: 'about the next sentence' });
+		expect(findHighlightsInIndexAtPoint(await buildHighlightIndex(bytes), 0, CLICK)[0]).toMatchObject({
 			note: 'about the next sentence',
 		});
 	});
@@ -874,7 +981,8 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 	it('removing the clicked highlight leaves its neighbour alone', async () => {
 		const bytes = await makeTwoHighlights();
 
-		const result = await removeHighlightsAt(bytes, { pageIndex: 0, box: CLICK });
+		const target = (await inspectHighlightAtPoint(bytes, 0, CLICK))!.target!;
+		const result = await removeHighlightForTarget(bytes, target);
 
 		expect(result.removedCount).toBe(1);
 		const quotes = await getStoredQuotes(result.bytes);
@@ -885,10 +993,10 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 		const bytes = await makeTwoHighlights();
 		// Right of the wrapped highlight's short second line, left of where the
 		// next sentence starts: inside the /Rect, on no quad at all.
-		const gap = { left: 175, right: 175, top: 186, bottom: 186 };
+		const gap = { x: 175, y: 186 };
 
-		expect(await inspectHighlightAt(bytes, { pageIndex: 0, box: gap })).toBeNull();
-		expect(await hasHighlightAt(bytes, { pageIndex: 0, box: gap })).toBe(false);
+		expect(await inspectHighlightAtPoint(bytes, 0, gap)).toBeNull();
+		expect(findHighlightsInIndexAtPoint(await buildHighlightIndex(bytes), 0, gap)[0] ?? null).toBeNull();
 	});
 
 	it('resolves identically through the index and through the bytes', async () => {
@@ -897,10 +1005,17 @@ describe('neighbouring highlights are told apart by their quads, not their /Rect
 		await expectAgreementAcrossGrid(await makeTwoHighlights());
 	});
 
-	it('a selection crossing both still removes both', async () => {
+	it('a selection crossing both replaces both', async () => {
 		const bytes = await makeTwoHighlights();
 		const sweep = { left: 40, right: 360, top: 215, bottom: 178 };
 
-		expect((await removeHighlightsAt(bytes, { pageIndex: 0, box: sweep })).removedCount).toBe(2);
+		const result = await replaceOverlappingHighlightAnnotations(bytes, [{
+			pageIndex: 0,
+			quadPoints: [sweep.left, sweep.top, sweep.right, sweep.top, sweep.left, sweep.bottom, sweep.right, sweep.bottom],
+			box: sweep,
+			color: YELLOW,
+		}]);
+		const index = await buildHighlightIndex(result);
+		expect(index.get(0)).toHaveLength(1);
 	});
 });

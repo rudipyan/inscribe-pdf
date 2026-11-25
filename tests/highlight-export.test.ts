@@ -16,6 +16,8 @@ import {
 const PALETTE = [
 	{ name: 'Yellow', hex: '#ffff00' },
 	{ name: 'Red', hex: '#ff0000' },
+	{ name: 'Orange', hex: '#ff8000' },
+	{ name: 'Green', hex: '#00ff00' },
 	{ name: 'Purple', hex: '#a22cff' },
 ];
 
@@ -99,22 +101,39 @@ describe('buildEntryLink', () => {
 			'[[book.pdf#page=5|p. 5]]',
 		);
 	});
+
+	it('labels standalone page notes explicitly instead of falling back to an empty-quote alias', () => {
+		expect(
+			buildEntryLink({ pageNumber: 3, quote: '', annotationId: '42R', standaloneNote: true }, generate),
+		).toBe('[[book.pdf#page=3&annotation=42R|Note, p. 3]]');
+	});
 });
 
 describe('colorSwatch', () => {
-	it('names a palette color by exact match', () => {
+	it('keeps the built-in swatches matched to their exact built-in hex values', () => {
 		expect(colorSwatch('rgb(255, 255, 0)', PALETTE)).toBe('🟡');
+		expect(colorSwatch('rgb(255, 0, 0)', PALETTE)).toBe('🔴');
+		expect(colorSwatch('rgb(255, 128, 0)', PALETTE)).toBe('🟠');
+		expect(colorSwatch('rgb(0, 255, 0)', PALETTE)).toBe('🟢');
 		expect(colorSwatch('rgb(162, 44, 255)', PALETTE)).toBe('🟣');
 	});
 
-	it('gives no swatch to a color outside the palette', () => {
-		// Highlights made in other readers are arbitrary colors; guessing the
-		// nearest palette name would confidently mislabel them.
-		expect(colorSwatch('rgb(255, 182, 193)', PALETTE)).toBeNull();
+	it('exports the exact hex for a valid color outside the palette without inventing a name', () => {
+		expect(colorSwatch('rgb(255, 182, 193)', PALETTE))
+			.toBe('<span style="color: #ffb6c1">●</span> <code>#ffb6c1</code>');
 	});
 
 	it('gives no swatch to an unparseable color', () => {
 		expect(colorSwatch('', PALETTE)).toBeNull();
+	});
+
+	it('exports an exact custom swatch even when its name collides with a built-in', () => {
+		expect(colorSwatch('rgb(18, 52, 86)', [{ name: 'Yellow', hex: '#123456' }]))
+			.toBe('<span style="color: #123456">●</span> <code>Yellow</code> <code>#123456</code>');
+	});
+
+	it('rejects out-of-range RGB channels instead of formatting a malformed hex value', () => {
+		expect(colorSwatch('rgb(256, 0, 0)', PALETTE)).toBeNull();
 	});
 });
 
@@ -154,9 +173,32 @@ describe('formatExportBody', () => {
 		expect(out).toContain('worth remembering');
 	});
 
-	it('drops the swatch for an off-palette color rather than inventing a name', () => {
+	it('renders standalone page notes with a note marker and deep link instead of an unlabelled quote block', () => {
+		const out = body([
+			entry({
+				pageNumber: 3,
+				quote: '',
+				colorCss: '',
+				note: 'page-level observation',
+				link: '[[book.pdf#page=3&annotation=42R|Note, p. 3]]',
+				standaloneNote: true,
+			}),
+		]);
+		expect(out).toContain('> 📝 [[book.pdf#page=3&annotation=42R|Note, p. 3]]\n\npage-level observation');
+	});
+
+	it('exports an off-palette hex without inventing a palette name', () => {
 		const out = body([entry({ colorCss: 'rgb(255, 182, 193)' })]);
-		expect(out).toContain('> [[book.pdf#page=1&annotation=40R|a quoted sentence]]');
+		expect(out).toContain('> <span style="color: #ffb6c1">●</span> <code>#ffb6c1</code> [[book.pdf#page=1&annotation=40R|a quoted sentence]]');
+	});
+
+	it('exports custom hex and name without changing the quote link or attached note', () => {
+		const out = formatExportBody(
+			[entry({ colorCss: 'rgb(18, 52, 86)', note: 'keep this note' })],
+			{ sourceLink: '[[book.pdf]]', palette: [{ name: 'Yellow', hex: '#123456' }] },
+		);
+		expect(out).toContain('> <span style="color: #123456">●</span> <code>Yellow</code> <code>#123456</code> [[book.pdf#page=1&annotation=40R|a quoted sentence]]');
+		expect(out).toContain('keep this note');
 	});
 
 	it('says the block is regenerated, so nobody edits inside it expecting it to last', () => {

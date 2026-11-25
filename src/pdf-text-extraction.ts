@@ -18,7 +18,7 @@ export interface PdfJsTextItem {
 	width?: number;
 }
 
-const MAX_QUOTE_LENGTH = 300;
+const MAX_QUOTE_EXCERPT_LENGTH = 300;
 
 /** Normalizes pdf.js's quadPoints across the shapes it has shipped over time:
  * a flat numeric array-like (8 numbers per quad) or nested point-object arrays. */
@@ -45,13 +45,18 @@ export function quadPointsToRects(quadPoints: unknown): QuadRect[] {
 	return rects;
 }
 
-/** Normalizes whitespace and enforces the display/storage length cap. Shared
- * by extractQuote's geometric reconstruction and by the exact quote captured
- * at highlight-creation time (see annotate.ts's `quote` option), so both
- * paths produce the same shape of string. */
+/** Normalizes whitespace without losing text. Quotes are stored in full; only
+ * presentation paths should call excerptQuote. */
 export function normalizeQuote(text: string): string {
-	const quote = text.replace(/\s+/g, ' ').trim();
-	return quote.length > MAX_QUOTE_LENGTH ? quote.slice(0, MAX_QUOTE_LENGTH - 1) + '…' : quote;
+	return text.replace(/\s+/g, ' ').trim();
+}
+
+/** A bounded label for list rows and other compact previews. */
+export function excerptQuote(text: string): string {
+	const quote = normalizeQuote(text);
+	return quote.length > MAX_QUOTE_EXCERPT_LENGTH
+		? `${quote.slice(0, MAX_QUOTE_EXCERPT_LENGTH - 1)}…`
+		: quote;
 }
 
 interface WordSpan {
@@ -93,7 +98,7 @@ function estimateWordSpans(str: string, x0: number, width: number): WordSpan[] {
  * highlight's quads.
  *
  * This is only ever a FALLBACK, used when a highlight has no quote captured
- * at creation time (see annotate.ts's getStoredQuotes / addHighlightAnnotation's
+ * at creation time (see annotate.ts's getStoredQuotes / addHighlightAnnotations's
  * `quote` option) -- e.g. a highlight made by another tool, or by an older
  * version of this plugin. Word-level estimation exists because pdf.js text
  * items are frequently whole words or even whole lines (measured directly
@@ -121,7 +126,7 @@ function estimateWordSpans(str: string, x0: number, width: number): WordSpan[] {
  * "Verdad sobre Dios" vanish from a real highlight's quote). Matching against
  * every quad on the item's baseline instead means a word only needs to be
  * covered by ANY of them. */
-export function extractQuote(rects: QuadRect[], textItems: PdfJsTextItem[]): string {
+export function extractQuote(rects: readonly QuadRect[], textItems: PdfJsTextItem[]): string {
 	const parts: string[] = [];
 	for (const item of textItems) {
 		const baseline = item.transform?.[5];

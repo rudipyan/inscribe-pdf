@@ -39,6 +39,8 @@ export interface FlashcardBlock {
 	key: string;
 	pageNumber: number;
 	block: string;
+	/** Previous formatting, used only to migrate an exact existing card. */
+	legacyBlock?: string;
 }
 
 /** Defuses the two sequences that would make the card split in the wrong
@@ -53,18 +55,28 @@ export function neutralizeCardSyntax(text: string): string {
 		.join('\n');
 }
 
-export function formatCard(source: FlashcardSource): string {
-	const question = neutralizeCardSyntax((source.note ?? '').trim());
-	const answer = `${neutralizeCardSyntax(source.quote)} — ${source.link}`;
+function renderCard(source: FlashcardSource, normalizeParagraphs: boolean): string {
+	// Blank lines delimit cards in spaced-repetition notes. Keep line breaks,
+	// but collapse empty paragraphs inside generated questions and answers.
+	const text = (value: string) => {
+		const safe = neutralizeCardSyntax(value);
+		return normalizeParagraphs ? safe.replace(/\r\n?/g, '\n').split('\n').filter((line) => line.trim() !== '').join('\n') : safe;
+	};
+	const question = text((source.note ?? '').trim());
+	const answer = `${text(source.quote)} — ${source.link}`;
 
 	// Measured on what the user actually sees: the link markup is long but
 	// renders as a short "p. N", so counting it would push ordinary cards into
 	// the multi-line form for no reason.
 	const renderedLength = question.length + source.quote.length;
-	if (!question.includes('\n') && renderedLength <= MAX_SINGLE_LINE_LENGTH) {
+	if (!question.includes('\n') && (!normalizeParagraphs || !answer.includes('\n')) && renderedLength <= MAX_SINGLE_LINE_LENGTH) {
 		return `${question} ${SINGLE_LINE_SEPARATOR} ${answer}`;
 	}
 	return `${question}\n${MULTI_LINE_SEPARATOR}\n${answer}`;
+}
+
+export function formatCard(source: FlashcardSource): string {
+	return renderCard(source, true);
 }
 
 /** Only highlights carrying a note become cards: the note is the question, and
@@ -72,11 +84,16 @@ export function formatCard(source: FlashcardSource): string {
 export function buildFlashcardBlocks(sources: FlashcardSource[]): FlashcardBlock[] {
 	return sources
 		.filter((source) => (source.note ?? '').trim().length > 0)
-		.map((source) => ({
-			key: source.key,
-			pageNumber: source.pageNumber,
-			block: formatCard(source),
-		}));
+		.map((source) => {
+			const block = formatCard(source);
+			const legacyBlock = renderCard(source, false);
+			return {
+				key: source.key,
+				pageNumber: source.pageNumber,
+				block,
+				...(legacyBlock !== block ? { legacyBlock } : {}),
+			};
+		});
 }
 
 function pageHeading(pageNumber: number): string {
@@ -140,17 +157,38 @@ function renderNote(sections: Section[]): string {
 	return `${parts.join('\n\n')}\n`;
 }
 
-/** Identifies chunks this file wrote: card syntax plus an annotation link.
- * Used only to decide what may be moved to `## Orphaned`, so it deliberately
- * requires both -- a paragraph of the user's own that merely happens to quote
- * an annotation link is left where it is. Cards for highlights with no
- * annotation id (keyed by their quote instead) aren't recognised here and so
- * are never orphaned; they are simply left in place. */
-function isOurCard(chunk: Chunk): boolean {
+interface GeneratedCardLink {
+	pageNumber: number;
+	annotationId: string | null;
+}
+
+/** Extracts the target from the final generated answer link, never from the
+ * question text, which may itself mention an annotation identifier. */
+function finalGeneratedCardLink(chunk: Chunk): GeneratedCardLink | null {
+	const bodyLines = chunk.lines.filter((line) => !SCHEDULE_LINE.test(line.trim()));
+	const lastLine = bodyLines[bodyLines.length - 1]?.trim() ?? '';
+	const wiki = /^.*\[\[([^\]\n]+)\]\]$/.exec(lastLine);
+	const markdown = wiki ? null : /^.*\[[^\]\n]*\]\(([^)\n]+)\)$/.exec(lastLine);
+	const target = wiki?.[1]?.split('|', 1)[0] ?? markdown?.[1] ?? null;
+	if (!target) return null;
+	const page = /#page=(\d+)(?:&|$)/.exec(target);
+	if (!page) return null;
+	const annotation = /(?:[?&])annotation=([^&#\s|)\]]+)/.exec(target);
+	return { pageNumber: Number(page[1]), annotationId: annotation?.[1] ?? null };
+}
+
+function hasCardSyntax(chunk: Chunk): boolean {
 	const text = chunkText(chunk);
-	const hasCardSyntax =
-		text.includes(SINGLE_LINE_SEPARATOR) || chunk.lines.some((line) => line.trim() === MULTI_LINE_SEPARATOR);
-	return hasCardSyntax && /annotation=[A-Za-z0-9]+/.test(text);
+	return text.includes(SINGLE_LINE_SEPARATOR) || chunk.lines.some((line) => line.trim() === MULTI_LINE_SEPARATOR);
+}
+
+function annotationIdFromKey(key: string): string | null {
+	const match = /^(?:#page=\d+&)?annotation=([^&#\s|)\]]+)$/.exec(key);
+	return match?.[1] ?? null;
+}
+
+function cardBody(chunk: Chunk): string {
+	return chunk.lines.filter((line) => !SCHEDULE_LINE.test(line.trim())).join('\n');
 }
 
 /** Replaces a card's own lines with new text, keeping its schedule line. */
@@ -189,21 +227,49 @@ export interface FlashcardMergeResult {
 	orphaned: number;
 }
 
+/** Convert only a complete, exact old generated block. Its schedule and
+ * surrounding user paragraphs remain outside the replacement. */
+function migrateLegacyCards(content: string, blocks: FlashcardBlock[]): string {
+	for (const { block, legacyBlock } of blocks) {
+		if (!legacyBlock) continue;
+		let from = 0;
+		while (from < content.length) {
+			const at = content.indexOf(legacyBlock, from);
+			if (at < 0) break;
+			const end = at + legacyBlock.length;
+			const precedingLines = content.slice(0, at).split('\n');
+			const precedingLine = precedingLines[precedingLines.length - 2];
+			const startsBlock = at === 0 || (content[at - 1] === '\n' &&
+				(precedingLine?.trim() === '' || precedingLine?.startsWith('## ')));
+			if (startsBlock && (end === content.length || content[end] === '\n')) {
+				content = content.slice(0, at) + block + content.slice(end);
+				from = at + block.length;
+			} else from = end;
+		}
+	}
+	return content;
+}
+
 export function mergeFlashcardNote(
 	existing: string | null,
 	blocks: FlashcardBlock[],
 ): FlashcardMergeResult {
-	const sections = parseNote(existing?.trim() ? existing : `${FLASHCARD_TAG}\n`);
+	const content = existing?.trim() ? migrateLegacyCards(existing, blocks) : `${FLASHCARD_TAG}\n`;
+	const sections = parseNote(content);
 	let added = 0;
 	let kept = 0;
 	let updated = 0;
 	let orphaned = 0;
 
 	/** Every card currently in the note, with where it sits. */
-	const placed: { chunk: Chunk; section: Section }[] = [];
+	const placed: { chunk: Chunk; section: Section; annotationId: string }[] = [];
+	const pageOnly: { chunk: Chunk; section: Section }[] = [];
 	for (const section of sections) {
 		for (const chunk of section.chunks) {
-			if (isOurCard(chunk)) placed.push({ chunk, section });
+			if (!hasCardSyntax(chunk)) continue;
+			const link = finalGeneratedCardLink(chunk);
+			if (link?.annotationId) placed.push({ chunk, section, annotationId: link.annotationId });
+			else if (link) pageOnly.push({ chunk, section });
 		}
 	}
 
@@ -211,7 +277,12 @@ export function mergeFlashcardNote(
 
 	for (const block of blocks) {
 		const heading = pageHeading(block.pageNumber);
-		const found = placed.find(({ chunk }) => chunkText(chunk).includes(block.key));
+		const annotationId = annotationIdFromKey(block.key);
+		if (!annotationId && pageOnly.some(({ chunk, section }) => section.heading === heading && cardBody(chunk) === block.block)) {
+			kept++;
+			continue;
+		}
+		const found = annotationId ? placed.find((card) => card.annotationId === annotationId) : undefined;
 
 		if (!found) {
 			sectionFor(sections, heading).chunks.push({ lines: block.block.split('\n') });
@@ -220,7 +291,7 @@ export function mergeFlashcardNote(
 		}
 
 		matched.add(found.chunk);
-		const isCurrent = chunkText(found.chunk).startsWith(block.block);
+		const isCurrent = cardBody(found.chunk) === block.block;
 		// A card sitting under `## Orphaned` whose highlight came back belongs in
 		// its page section again -- that move is what makes an orphaning
 		// reversible rather than a one-way trip.

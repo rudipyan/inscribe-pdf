@@ -116,6 +116,83 @@ describe('mergeFlashcardNote', () => {
 		expect(out.kept).toBe(1);
 	});
 
+	it('matches annotation IDs exactly when one ID is a prefix of another', () => {
+		const existing = [
+			FLASHCARD_TAG,
+			'',
+			'## Page 1',
+			'',
+			'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]',
+			'<!--SR:!2026-01-02,7,250-->',
+			'',
+			'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]',
+			'<!--SR:!2026-03-04,21,280-->',
+			'',
+		].join('\n');
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R', 'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]'),
+			block('annotation=12R1', 'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 0, kept: 2, updated: 0, orphaned: 0 });
+		expect(out.content).toContain('Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+		expect(out.content).toContain('Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-03-04,21,280-->');
+	});
+
+	it('orphans only the removed card when annotation IDs share a prefix', () => {
+		const existing = [
+			FLASHCARD_TAG,
+			'',
+			'## Page 1',
+			'',
+			'Question for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]',
+			'<!--SR:!2026-01-02,7,250-->',
+			'',
+			'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]',
+			'<!--SR:!2026-03-04,21,280-->',
+			'',
+		].join('\n');
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R', 'Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 0, kept: 1, updated: 0, orphaned: 1 });
+		expect(out.content).toContain('Question for 12R :: Short answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-03-04,21,280-->');
+		expect(out.content).toContain('## Orphaned\n\nQuestion for 12R1 :: Long answer [[x#page=1&annotation=12R1|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+	});
+
+	it('does not match an annotation ID mentioned in another card question', () => {
+		const existing = `${FLASHCARD_TAG}\n\n## Page 1\n\nQuestion mentions annotation=12R1 :: Answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-01-02,7,250-->\n`;
+		const out = mergeFlashcardNote(existing, [
+			block('annotation=12R1', 'New question :: New answer [[x#page=1&annotation=12R1|p. 1]]'),
+		]);
+
+		expect(out).toMatchObject({ added: 1, kept: 0, updated: 0, orphaned: 1 });
+		expect(out.content).toContain('## Orphaned\n\nQuestion mentions annotation=12R1 :: Answer [[x#page=1&annotation=12R|p. 1]]\n<!--SR:!2026-01-02,7,250-->');
+		expect(out.content).toContain('New question :: New answer [[x#page=1&annotation=12R1|p. 1]]');
+	});
+
+	it('reuses only an exact page-only card and preserves its review schedule', () => {
+		const card = block('The answer text', 'Question :: Answer [[x#page=1|p. 1]]');
+		const first = mergeFlashcardNote(null, [card]);
+		const scheduled = first.content.replace(`${card.block}\n`, `${card.block}\n<!--SR:!2026-04-05,7,250-->\n`);
+		const second = mergeFlashcardNote(scheduled, [card]);
+
+		expect(second.content).toBe(scheduled);
+		expect(second).toMatchObject({ added: 0, kept: 1, updated: 0, orphaned: 0 });
+		expect(second.content).toContain(`${card.block}\n<!--SR:!2026-04-05,7,250-->`);
+	});
+
+	it('leaves changed page-only cards untouched rather than rewriting or orphaning them', () => {
+		const previous = 'Old wording :: Answer [[x#page=1|p. 1]]';
+		const existing = `${FLASHCARD_TAG}\n\n## Page 1\n\n${previous}\n<!--SR:!2026-04-05,7,250-->\n`;
+		const out = mergeFlashcardNote(existing, [block('The answer text', 'New wording :: Answer [[x#page=1|p. 1]]')]);
+
+		expect(out).toMatchObject({ added: 1, kept: 0, updated: 0, orphaned: 0 });
+		expect(out.content).toContain(`${previous}\n<!--SR:!2026-04-05,7,250-->`);
+		expect(out.content).toContain('New wording :: Answer [[x#page=1|p. 1]]');
+	});
+
 	it('appends a genuinely new card under its page heading', () => {
 		const existing = [
 			FLASHCARD_TAG,
@@ -283,4 +360,63 @@ describe('mergeFlashcardNote', () => {
 		expect(third.content).toBe(second.content);
 		expect(third).toMatchObject({ added: 0, updated: 0, orphaned: 0 });
 	});
+});
+
+
+describe('paragraph-safe flashcard sync', () => {
+	it.each([
+		{ note: 'First paragraph\n\nSecond paragraph' },
+		{ note: 'First paragraph\n\u00a0\nSecond paragraph' },
+		{ note: 'First paragraph\n\u2003\nSecond paragraph' },
+		{ quote: 'First answer\n \nSecond answer' },
+		{ note: 'First paragraph\n\n\nSecond paragraph', quote: 'First answer\n\nSecond answer' },
+	])('converges with blank paragraphs in $note / $quote', (over) => {
+		const cards = buildFlashcardBlocks([source(over)]);
+		const first = mergeFlashcardNote(null, cards);
+		const second = mergeFlashcardNote(first.content, cards);
+		const third = mergeFlashcardNote(second.content, cards);
+		expect(second.content).toBe(first.content);
+		expect(third.content).toBe(first.content);
+		expect(second).toMatchObject({ added: 0, updated: 0, kept: 1 });
+		expect(cards[0]!.block).not.toMatch(/\n[ \t]*\n/);
+	});
+
+	it('migrates an exact legacy paragraph card, preserves schedule and adjacent user paragraphs', () => {
+		const cards = buildFlashcardBlocks([source({ note: 'First paragraph\n\nSecond paragraph', quote: 'Answer paragraph\n\nLast answer' })]);
+		const schedule = '<!--SR:!2026-10-20,7,250-->';
+		const existing = `#flashcards\n\n## Page 1\n\nMy own first paragraph.\n\nMy own second paragraph.\n\n${cards[0]!.legacyBlock}\n${schedule}\n\nAfter the card.\n`;
+		const migrated = mergeFlashcardNote(existing, cards);
+		expect(migrated.content).toContain(`${cards[0]!.block}\n${schedule}`);
+		expect(migrated.content.match(/First paragraph/g)).toHaveLength(1);
+		expect(migrated.content).toContain('My own first paragraph.\n\nMy own second paragraph.');
+		expect(migrated.content).toContain('After the card.');
+		expect(mergeFlashcardNote(migrated.content, cards).content).toBe(migrated.content);
+		const changed = buildFlashcardBlocks([source({ note: 'Updated first\n\nUpdated second' })]);
+		const edited = mergeFlashcardNote(migrated.content, changed);
+		expect(edited.content).not.toContain('First paragraph');
+		expect(edited.content).toContain(`${changed[0]!.block}\n${schedule}`);
+		const orphan = mergeFlashcardNote(edited.content, []);
+		expect(orphan.content).toContain(`## Orphaned\n\n${changed[0]!.block}\n${schedule}`);
+		const restored = mergeFlashcardNote(orphan.content, changed);
+		expect(restored.content).toContain(`${changed[0]!.block}\n${schedule}`);
+		expect(restored.content).toContain('After the card.');
+		expect(mergeFlashcardNote(restored.content, changed).content).toBe(restored.content);
+	});
+
+	it('does not migrate a partial legacy match embedded in user prose', () => {
+		const cards = buildFlashcardBlocks([source({ note: 'First\n\nSecond' })]);
+		const prose = `My example: ${cards[0]!.legacyBlock} more text`;
+		const out = mergeFlashcardNote(`#flashcards\n\n${prose}\n`, cards);
+		expect(out.content).toContain(prose);
+	});
+});
+
+
+it('preserves an ambiguous handwritten preface attached to a legacy card', () => {
+	const cards = buildFlashcardBlocks([source({ note: 'First paragraph\n\nSecond paragraph' })]);
+	const existing = `#flashcards\n\n## Page 1\n\nMy handwritten preface\n${cards[0]!.legacyBlock}\n<!--SR:!2026-10-20,7,250-->\n`;
+	const out = mergeFlashcardNote(existing, cards);
+	expect(out.content).toContain('My handwritten preface');
+	expect(out.content).toContain('<!--SR:!2026-10-20,7,250-->');
+	expect(mergeFlashcardNote(out.content, cards).content).toBe(out.content);
 });
