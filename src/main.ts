@@ -565,6 +565,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				if (this.pdfSessions.onExternalModify(file.path, size)) {
 					this.clearPendingOverlaysForPath(file.path);
 					this.invalidateHighlightIndex();
+					this.refreshAnnotationToolbars();
 				}
 			} else {
 				this.invalidateHighlightIndex();
@@ -3594,7 +3595,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 
 	private createSessionManager(): PdfSessionManager<TFile> {
 		const options = Platform.isIosApp
-			? { debounceMs: 1000, maxWaitMs: 5000, maxOpenSessions: 1, maxCleanBaseBytes: 50 * 1024 * 1024 }
+			? { debounceMs: 1000, maxWaitMs: 5000, maxOpenSessions: 2, maxCleanBaseBytes: 60 * 1024 * 1024 }
 			: undefined;
 		return new PdfSessionManager<TFile>({
 			readBinary: async (file) => new Uint8Array(await this.app.vault.readBinary(file)),
@@ -3620,6 +3621,11 @@ export default class PdfHighlighterPlugin extends Plugin {
 			onHistoryChanged: () => {
 				if (!this.isUnloading) this.refreshAnnotationToolbars();
 			},
+			onSessionDropped: (_file, path) => {
+				this.clearPendingOverlaysForPath(path);
+				this.invalidateHighlightIndex();
+				if (!this.isUnloading) this.refreshAnnotationToolbars();
+			},
 			onVisualSynced: (_file, path, flushRevision, refreshedPages) => {
 				if (!this.isUnloading && refreshedPages.length > 0) {
 					this.clearPendingOverlaysUpToRevision(path, refreshedPages, flushRevision);
@@ -3636,6 +3642,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			pagesToRefresh: number[];
 			flushRevision: number;
 			alreadyVisuallyRefreshed: boolean;
+			isRevisionCurrent(): boolean;
 		},
 	): Promise<void> {
 		const path = normalizeVaultRelativePath(file.path);
@@ -3699,8 +3706,9 @@ export default class PdfHighlighterPlugin extends Plugin {
 
 			await Promise.all(inPlace.map(async ({ view, token }) => {
 				if (this.isUnloading) return;
-				if (context.alreadyVisuallyRefreshed || context.pagesToRefresh.length === 0) {
+				if (context.alreadyVisuallyRefreshed || context.pagesToRefresh.length === 0 || !context.isRevisionCurrent()) {
 					if (view.acknowledgeInPlacePdfWrite?.(token)) return;
+					if (!context.isRevisionCurrent()) return;
 				}
 				let result: Awaited<ReturnType<ActivePdfView['refreshAnnotationsInPlace']>>;
 				try {
@@ -3761,15 +3769,20 @@ export default class PdfHighlighterPlugin extends Plugin {
 		});
 		void Promise.all(refreshPromises).then((statuses) => {
 			if (this.isUnloading || !this.pdfSessions || statuses.length === 0) return;
-			if (!statuses.every((status) => status === 'refreshed')) return;
-			const remaining = this.pdfSessions.confirmVisualRefresh(
-				file.path,
-				result.changedPageIndexes,
-				result.revision,
-			);
-			for (const view of views) {
-				const overlayState = this.pendingHighlightOverlays.get(view.containerEl);
-				if (overlayState?.file === file) overlayState.overlay.sync(remaining);
+			if (statuses.every((status) => status === 'refreshed')) {
+				const remaining = this.pdfSessions.confirmVisualRefresh(
+					file.path,
+					result.changedPageIndexes,
+					result.revision,
+				);
+				for (const view of views) {
+					const overlayState = this.pendingHighlightOverlays.get(view.containerEl);
+					if (overlayState?.file === file) overlayState.overlay.sync(remaining);
+				}
+				return;
+			}
+			if (statuses.some((status) => status === 'unavailable')) {
+				void this.pdfSessions.flushNow(file.path).catch(() => {});
 			}
 		});
 	}

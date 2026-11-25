@@ -293,7 +293,7 @@ interface InPlacePdfViewState {
 	disposed: boolean;
 }
 
-const IN_PLACE_EVENT_WINDOW_MS = 2500;
+const IN_PLACE_EVENT_WINDOW_MS = 12000;
 let inPlaceWriteId = 0;
 const inPlacePdfViewStates = new WeakMap<RawPdfView, InPlacePdfViewState>();
 const loadingTaskLeases = new WeakMap<PdfJsLoadingTaskLike, ReturnType<typeof retainPdfDocument>>();

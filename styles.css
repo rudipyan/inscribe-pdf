@@ -886,6 +886,15 @@ body.theme-dark :is(
 	filter: none;
 }
 
+.study-pdf-reading-appearance-black-white .pdfViewer .page .study-pdf-highlight-preview,
+body.theme-dark :is(
+	.study-pdf-reading-appearance-black-white .pdf-container.mod-themed,
+	.study-pdf-reading-appearance-black-white.pdf-container.mod-themed
+) .pdfViewer .page .study-pdf-highlight-preview {
+	mix-blend-mode: screen;
+	opacity: 0.45;
+}
+
 body.theme-dark :is(
 	.study-pdf-reading-appearance-sepia .pdf-container.mod-themed,
 	.study-pdf-reading-appearance-sepia.pdf-container.mod-themed

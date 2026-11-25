@@ -29,6 +29,7 @@ export const MAX_OPEN_SESSIONS = 3;
 export const MAX_CLEAN_BASE_BYTES = 160 * 1024 * 1024;
 export const MAX_UNDO_STEPS = 50;
 const OWN_WRITE_EVENT_GRACE_MS = 2500;
+const OWN_WRITE_SIZE_MEMORY_MS = 15000;
 
 export interface SessionFileLike {
 	path: string;
@@ -65,7 +66,7 @@ export interface SessionUndoResult {
 	status: 'applied' | 'empty';
 	revision: number;
 	changedPageIndexes: number[];
-	visualMode: 'memory-canvas-refresh';
+	visualMode: VisualRefreshMode;
 	memoryBytes?: Uint8Array;
 	pendingOverlays: PendingOverlayEntry[];
 	highlightIndex: HighlightIndex;
@@ -84,6 +85,7 @@ export interface PdfSessionWriteContext {
 	pagesToRefresh: number[];
 	flushRevision: number;
 	alreadyVisuallyRefreshed: boolean;
+	isRevisionCurrent(): boolean;
 }
 
 export interface PdfSessionAdapter<File extends SessionFileLike> {
@@ -93,12 +95,24 @@ export interface PdfSessionAdapter<File extends SessionFileLike> {
 	onExternalConflict(file: File, path: string, reason: string): Promise<void> | void;
 	onFlushError?(file: File, path: string, error: unknown): void;
 	onHistoryChanged?(file: File, path: string): void;
+	onSessionDropped?(file: File, path: string): void;
 	onVisualSynced?(file: File, path: string, flushRevision: number, refreshedPages: number[]): void;
 }
 
-interface UndoEntry {
+interface OverlayUndoMetadata {
+	readonly purePendingKind?: 'add' | 'recolor';
+	readonly addedOverlays?: readonly Omit<PendingOverlayEntry, 'revision'>[];
+	readonly recolorOverlay?: {
+		readonly refKey: string;
+		readonly prevColorCss: string;
+		readonly nextColorCss: string;
+	};
+}
+
+interface UndoEntry extends OverlayUndoMetadata {
 	readonly patches: PdfObjectUndoPatch[];
 	readonly pageIndexes: number[];
+	readonly createdRevision: number;
 }
 
 interface PdfWorkingSession<File extends SessionFileLike> {
@@ -109,6 +123,8 @@ interface PdfWorkingSession<File extends SessionFileLike> {
 	basePrevStartXRef: number;
 	lastDiskFingerprint: string;
 	lastDiskByteLength: number;
+	recentOwnWriteByteLengths: Map<number, number>;
+	externalVerifyInFlight: boolean;
 	openedStat: { mtime: number; size: number };
 	pdfDoc: PDFDocument;
 	baseSnapshot: DocumentSnapshot | null;
@@ -263,62 +279,85 @@ export class PdfSessionManager<File extends SessionFileLike> {
 			}
 			session.lastUsed = ++this.useCounter;
 
-			if (op.kind === 'add-highlights') {
+			let activeOp = op;
+			if (session.incrementalMode === 'full-rewrite') {
+				activeOp = await this.upgradeEncryptedSessionBeforeMutation(session, op);
+			}
+
+			if (activeOp.kind === 'add-highlights') {
 				const { addedRefs, changedPageIndexes, patches } = addHighlightsToDoc(
 					session.pdfDoc,
 					session.baseSnapshot,
-					op.optionsList,
+					activeOp.optionsList,
 				);
-				return this.commitInMemoryMutation(session, changedPageIndexes, patches, 'overlay-only', (revision) => {
-					op.optionsList.forEach((opt, idx) => {
-						const ref = addedRefs[idx];
-						if (!ref) return;
-						const refKey = refKeyOf(ref);
-						session.pendingAddedRefs.set(refKey, {
-							refKey,
-							pageIndex: opt.pageIndex,
-							quadPoints: [...opt.quadPoints],
-							colorCss: rgbToCss(opt.color),
-							opacity: opt.opacity ?? 1,
-							revision,
-							isRegion: opt.isRegion,
-						});
+				const addedOverlays: Omit<PendingOverlayEntry, 'revision'>[] = [];
+				activeOp.optionsList.forEach((opt, idx) => {
+					const ref = addedRefs[idx];
+					if (!ref) return;
+					addedOverlays.push({
+						refKey: refKeyOf(ref),
+						pageIndex: opt.pageIndex,
+						quadPoints: [...opt.quadPoints],
+						colorCss: rgbToCss(opt.color),
+						opacity: opt.opacity ?? 1,
+						isRegion: opt.isRegion,
 					});
 				});
+				return this.commitInMemoryMutation(
+					session,
+					changedPageIndexes,
+					patches,
+					'overlay-only',
+					(revision) => {
+						for (const entry of addedOverlays) {
+							session.pendingAddedRefs.set(entry.refKey, { ...entry, revision });
+						}
+					},
+					{ purePendingKind: 'add', addedOverlays },
+				);
 			}
 
-			if (op.kind === 'replace-overlapping') {
+			if (activeOp.kind === 'replace-overlapping') {
 				const { addedAnnotations, removedRefs, changedPageIndexes, patches } = replaceOverlappingHighlightsInDoc(
 					session.pdfDoc,
 					session.baseSnapshot,
-					op.optionsList,
+					activeOp.optionsList,
 				);
 				const removedBaked = removedRefs.some((ref) => !session.pendingAddedRefs.has(refKeyOf(ref)));
 				const mode: VisualRefreshMode = removedBaked ? 'memory-canvas-refresh' : 'overlay-only';
-				return this.commitInMemoryMutation(session, changedPageIndexes, patches, mode, (revision) => {
-					for (const ref of removedRefs) session.pendingAddedRefs.delete(refKeyOf(ref));
-					for (const { ref, replacement } of addedAnnotations) {
-						const refKey = refKeyOf(ref);
-						session.pendingAddedRefs.set(refKey, {
-							refKey,
-							pageIndex: replacement.options.pageIndex,
-							quadPoints: [...replacement.options.quadPoints],
-							colorCss: rgbToCss(replacement.options.color),
-							opacity: replacement.opacity,
-							revision,
-						});
-					}
-				});
+				const addedOverlays: Omit<PendingOverlayEntry, 'revision'>[] = addedAnnotations.map(({ ref, replacement }) => ({
+					refKey: refKeyOf(ref),
+					pageIndex: replacement.options.pageIndex,
+					quadPoints: [...replacement.options.quadPoints],
+					colorCss: rgbToCss(replacement.options.color),
+					opacity: replacement.opacity,
+				}));
+				const overlayMeta: OverlayUndoMetadata = !removedBaked && removedRefs.length === 0
+					? { purePendingKind: 'add', addedOverlays }
+					: {};
+				return this.commitInMemoryMutation(
+					session,
+					changedPageIndexes,
+					patches,
+					mode,
+					(revision) => {
+						for (const ref of removedRefs) session.pendingAddedRefs.delete(refKeyOf(ref));
+						for (const entry of addedOverlays) {
+							session.pendingAddedRefs.set(entry.refKey, { ...entry, revision });
+						}
+					},
+					overlayMeta,
+				);
 			}
 
-			if (op.kind === 'recolor') {
-				this.assertTargetMatchesSession(session, op.target);
+			if (activeOp.kind === 'recolor') {
+				this.assertTargetMatchesSession(session, activeOp.target);
 				const { updatedCount, patches } = recolorHighlightInDoc(session.pdfDoc, session.baseSnapshot, {
-					pageIndex: op.target.pageIndex,
-					objectNumber: op.target.objectNumber,
-					generationNumber: op.target.generationNumber,
-					geometrySignature: op.target.geometrySignature,
-					color: op.color,
+					pageIndex: activeOp.target.pageIndex,
+					objectNumber: activeOp.target.objectNumber,
+					generationNumber: activeOp.target.generationNumber,
+					geometrySignature: activeOp.target.geometrySignature,
+					color: activeOp.color,
 				});
 				if (updatedCount === 0) {
 					return {
@@ -331,28 +370,42 @@ export class PdfSessionManager<File extends SessionFileLike> {
 						sessionFingerprint: session.sessionFingerprint,
 					};
 				}
-				const refKey = targetRefKey(op.target);
+				const refKey = targetRefKey(activeOp.target);
 				const pending = session.pendingAddedRefs.get(refKey);
+				const nextColorCss = rgbToCss(activeOp.color);
 				const mode: VisualRefreshMode = pending ? 'overlay-only' : 'memory-canvas-refresh';
-				return this.commitInMemoryMutation(session, [op.target.pageIndex], patches, mode, (revision) => {
-					if (pending) {
-						session.pendingAddedRefs.set(refKey, {
-							...pending,
-							colorCss: rgbToCss(op.color),
-							revision,
-						});
+				const overlayMeta: OverlayUndoMetadata = pending
+					? {
+						purePendingKind: 'recolor',
+						recolorOverlay: { refKey, prevColorCss: pending.colorCss, nextColorCss },
 					}
-				});
+					: {};
+				return this.commitInMemoryMutation(
+					session,
+					[activeOp.target.pageIndex],
+					patches,
+					mode,
+					(revision) => {
+						if (pending) {
+							session.pendingAddedRefs.set(refKey, {
+								...pending,
+								colorCss: nextColorCss,
+								revision,
+							});
+						}
+					},
+					overlayMeta,
+				);
 			}
 
-			if (op.kind === 'set-note') {
-				const effectiveTarget = this.resolveTargetForNote(session, op.target);
+			if (activeOp.kind === 'set-note') {
+				const effectiveTarget = this.resolveTargetForNote(session, activeOp.target);
 				const { updatedCount, patches } = setHighlightNoteInDoc(session.pdfDoc, session.baseSnapshot, {
 					pageIndex: effectiveTarget.pageIndex,
 					objectNumber: effectiveTarget.objectNumber,
 					generationNumber: effectiveTarget.generationNumber,
 					geometrySignature: effectiveTarget.geometrySignature,
-					note: op.note,
+					note: activeOp.note,
 				});
 				if (updatedCount === 0) {
 					return {
@@ -380,16 +433,16 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				);
 			}
 
-			if (op.kind === 'remove') {
-				this.assertTargetMatchesSession(session, op.target);
+			if (activeOp.kind === 'remove') {
+				this.assertTargetMatchesSession(session, activeOp.target);
 				const { removedCount, removedRef, patches } = removeHighlightInDoc(
 					session.pdfDoc,
 					session.baseSnapshot,
 					{
-						pageIndex: op.target.pageIndex,
-						objectNumber: op.target.objectNumber,
-						generationNumber: op.target.generationNumber,
-						geometrySignature: op.target.geometrySignature,
+						pageIndex: activeOp.target.pageIndex,
+						objectNumber: activeOp.target.objectNumber,
+						generationNumber: activeOp.target.generationNumber,
+						geometrySignature: activeOp.target.geometrySignature,
 					},
 				);
 				if (removedCount === 0) {
@@ -406,18 +459,18 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				const refKey = refKeyOf(removedRef);
 				const wasPending = session.pendingAddedRefs.has(refKey);
 				const mode: VisualRefreshMode = wasPending ? 'overlay-only' : 'memory-canvas-refresh';
-				return this.commitInMemoryMutation(session, [op.target.pageIndex], patches, mode, () => {
+				return this.commitInMemoryMutation(session, [activeOp.target.pageIndex], patches, mode, () => {
 					if (wasPending) session.pendingAddedRefs.delete(refKey);
 				});
 			}
 
 			// add-page-note
 			const { patches } = addPageNoteToDoc(session.pdfDoc, session.baseSnapshot, {
-				pageIndex: op.pageIndex,
-				point: op.point,
-				note: op.note,
+				pageIndex: activeOp.pageIndex,
+				point: activeOp.point,
+				note: activeOp.note,
 			});
-			return this.commitInMemoryMutation(session, [op.pageIndex], patches, 'memory-canvas-refresh', () => {});
+			return this.commitInMemoryMutation(session, [activeOp.pageIndex], patches, 'memory-canvas-refresh', () => {});
 		});
 	}
 
@@ -452,13 +505,65 @@ export class PdfSessionManager<File extends SessionFileLike> {
 			const entry = session.undoStack[stepIndex]!;
 			const changedPageIndexes = applyUndoPatchToDoc(session.pdfDoc, session.baseSnapshot, entry.patches, direction);
 			session.undoCursor += direction === 'undo' ? -1 : 1;
-			const result = await this.finalizeRevisionChange(session, changedPageIndexes, 'memory-canvas-refresh', () => {});
+
+			const pagesNotBaked = entry.pageIndexes.every(
+				(pageIndex) => (session.pageVisualRevision.get(pageIndex) ?? 0) < entry.createdRevision,
+			);
+			let visualMode: VisualRefreshMode = 'memory-canvas-refresh';
+			let onUpdateOverlays: (nextRevision: number) => void = () => {};
+
+			if (
+				direction === 'undo' &&
+				entry.purePendingKind === 'add' &&
+				entry.addedOverlays &&
+				pagesNotBaked &&
+				entry.addedOverlays.every((overlay) => session.pendingAddedRefs.has(overlay.refKey))
+			) {
+				visualMode = 'overlay-only';
+				const added = entry.addedOverlays;
+				onUpdateOverlays = () => {
+					for (const overlay of added) session.pendingAddedRefs.delete(overlay.refKey);
+				};
+			} else if (direction === 'redo' && entry.purePendingKind === 'add' && entry.addedOverlays) {
+				const added = entry.addedOverlays;
+				if (pagesNotBaked) visualMode = 'overlay-only';
+				onUpdateOverlays = (nextRevision) => {
+					for (const overlay of added) {
+						session.pendingAddedRefs.set(overlay.refKey, { ...overlay, revision: nextRevision });
+					}
+				};
+			} else if (
+				entry.purePendingKind === 'recolor' &&
+				entry.recolorOverlay &&
+				pagesNotBaked &&
+				session.pendingAddedRefs.has(entry.recolorOverlay.refKey)
+			) {
+				visualMode = 'overlay-only';
+				const recolor = entry.recolorOverlay;
+				onUpdateOverlays = (nextRevision) => {
+					const current = session.pendingAddedRefs.get(recolor.refKey);
+					if (!current) return;
+					session.pendingAddedRefs.set(recolor.refKey, {
+						...current,
+						colorCss: direction === 'undo' ? recolor.prevColorCss : recolor.nextColorCss,
+						revision: nextRevision,
+					});
+				};
+			}
+
+			const result = await this.finalizeRevisionChange(
+				session,
+				changedPageIndexes,
+				visualMode,
+				onUpdateOverlays,
+				true,
+			);
 			this.adapter.onHistoryChanged?.(session.file, session.path);
 			return {
 				status: 'applied',
 				revision: result.revision,
 				changedPageIndexes: result.changedPageIndexes,
-				visualMode: 'memory-canvas-refresh',
+				visualMode: result.visualMode,
 				memoryBytes: result.memoryBytes,
 				pendingOverlays: result.pendingOverlays,
 				highlightIndex: result.highlightIndex,
@@ -503,23 +608,75 @@ export class PdfSessionManager<File extends SessionFileLike> {
 	}
 
 	/** Notifies the session manager of an Obsidian vault 'modify' event. Clean
-	 * sessions modified externally are evicted; own flush echoes are ignored. */
+	 * sessions modified externally are evicted; own flush echoes and delayed
+	 * iCloud coordination callbacks are checked safely without losing Undo/Redo. */
 	onExternalModify(path: string, currentStatSize?: number): boolean {
 		const key = normalizeVaultRelativePath(path);
 		const session = this.sessions.get(key);
 		if (!session || session.disposed) return false;
 		if (session.isFlushing) return false;
-		const sizeChangedExternally = currentStatSize !== undefined && currentStatSize !== session.lastDiskByteLength;
-		if (!sizeChangedExternally && Date.now() - session.lastOwnWriteCompletedAt <= OWN_WRITE_EVENT_GRACE_MS) {
-			return false;
-		}
 		if (session.revision > session.flushedRevision) {
 			// Preserve unsaved edits in memory; the next flushNow will run the exact
 			// disk byte comparison and invoke onExternalConflict before any write.
 			return false;
 		}
-		this.dropSession(key);
-		return true;
+		this.pruneRecentOwnWriteSizes(session);
+		const withinGrace = Date.now() - session.lastOwnWriteCompletedAt <= OWN_WRITE_EVENT_GRACE_MS;
+		if (currentStatSize !== undefined) {
+			if (currentStatSize === session.lastDiskByteLength) {
+				session.openedStat = { mtime: session.file.stat.mtime, size: currentStatSize };
+				if (withinGrace) return false;
+				void this.verifyCleanSessionAgainstDisk(session);
+				return false;
+			}
+			if (session.recentOwnWriteByteLengths.has(currentStatSize)) {
+				void this.verifyCleanSessionAgainstDisk(session);
+				return false;
+			}
+			this.dropSession(key);
+			return true;
+		}
+		if (withinGrace) return false;
+		void this.verifyCleanSessionAgainstDisk(session);
+		return false;
+	}
+
+	private async verifyCleanSessionAgainstDisk(session: PdfWorkingSession<File>): Promise<void> {
+		if (session.externalVerifyInFlight || session.disposed || session.isFlushing ||
+			session.revision > session.flushedRevision) return;
+		session.externalVerifyInFlight = true;
+		try {
+			if (!this.adapter.isFileCurrent(session.file, session.path)) {
+				this.dropSession(session.path);
+				return;
+			}
+			const diskRaw = await this.adapter.readBinary(session.file);
+			if (session.disposed || session.isFlushing || session.revision > session.flushedRevision) return;
+			const diskBytes = diskRaw instanceof Uint8Array ? diskRaw : new Uint8Array(diskRaw);
+			let diskMatches = diskBytes.byteLength === session.lastDiskByteLength;
+			if (diskMatches) {
+				const diskFingerprint = await fingerprintPdfBytes(diskBytes);
+				if (session.disposed || session.isFlushing || session.revision > session.flushedRevision) return;
+				diskMatches = diskFingerprint === session.lastDiskFingerprint;
+			}
+			if (diskMatches) {
+				session.openedStat = { mtime: session.file.stat.mtime, size: session.lastDiskByteLength };
+				return;
+			}
+			this.dropSession(session.path);
+		} catch {
+			if (!session.disposed && !session.isFlushing && session.revision <= session.flushedRevision) {
+				this.dropSession(session.path);
+			}
+		} finally {
+			session.externalVerifyInFlight = false;
+		}
+	}
+
+	private pruneRecentOwnWriteSizes(session: PdfWorkingSession<File>, now = Date.now()): void {
+		for (const [size, recordedAt] of session.recentOwnWriteByteLengths) {
+			if (now - recordedAt > OWN_WRITE_SIZE_MEMORY_MS) session.recentOwnWriteByteLengths.delete(size);
+		}
 	}
 
 	onFileRemovedOrRenamed(path: string): void {
@@ -563,6 +720,8 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				basePrevStartXRef: loaded.basePrevStartXRef,
 				lastDiskFingerprint: baseFingerprint,
 				lastDiskByteLength: baseBytes.byteLength,
+				recentOwnWriteByteLengths: new Map(),
+				externalVerifyInFlight: false,
 				openedStat: { mtime: file.stat.mtime, size: file.stat.size },
 				pdfDoc: loaded.pdfDoc,
 				baseSnapshot: loaded.baseSnapshot,
@@ -603,7 +762,70 @@ export class PdfSessionManager<File extends SessionFileLike> {
 	private isCleanSessionStale(session: PdfWorkingSession<File>, file: File): boolean {
 		if (session.revision > session.flushedRevision || session.isFlushing) return false;
 		if (Date.now() - session.lastOwnWriteCompletedAt <= OWN_WRITE_EVENT_GRACE_MS) return false;
+		this.pruneRecentOwnWriteSizes(session);
+		if (file.stat.size !== session.lastDiskByteLength && !session.recentOwnWriteByteLengths.has(file.stat.size)) {
+			return true;
+		}
+		// Never treat an updated mtime alone as stale after our own flush when
+		// file size still matches the bytes we wrote.
+		if (session.lastOwnWriteCompletedAt > -Infinity && file.stat.size === session.lastDiskByteLength) {
+			return false;
+		}
 		return session.openedStat.mtime !== file.stat.mtime || session.openedStat.size !== file.stat.size;
+	}
+
+	private async upgradeEncryptedSessionBeforeMutation(
+		session: PdfWorkingSession<File>,
+		op: SessionMutationOp,
+	): Promise<SessionMutationOp> {
+		let mappedTargetOrder: { pageIndex: number; annotsOrder: number; geometrySignature?: string } | null = null;
+		let validatedTarget: HighlightTarget | null = null;
+		if (op.kind === 'recolor' || op.kind === 'remove') {
+			this.assertTargetMatchesSession(session, op.target);
+			validatedTarget = op.target;
+		} else if (op.kind === 'set-note') {
+			validatedTarget = this.resolveTargetForNote(session, op.target);
+		}
+		if (validatedTarget) {
+			const target = validatedTarget;
+			const pageEntries = session.highlightIndex.get(target.pageIndex) ?? [];
+			const match = pageEntries.find((entry) =>
+				entry.target?.objectNumber === target.objectNumber &&
+				entry.target?.generationNumber === target.generationNumber,
+			);
+			if (match) {
+				mappedTargetOrder = {
+					pageIndex: target.pageIndex,
+					annotsOrder: match.annotsOrder,
+					geometrySignature: target.geometrySignature,
+				};
+			}
+		}
+
+		const decryptedBase = await serializeSessionBytes(session.pdfDoc, session.baseBytes, null, 'full-rewrite', 0);
+		const upgraded = await loadPdfDocForSession(decryptedBase);
+		if (upgraded.incrementalMode !== 'full-rewrite' && upgraded.baseSnapshot) {
+			session.baseBytes = decryptedBase;
+			session.basePrevStartXRef = upgraded.basePrevStartXRef;
+			session.pdfDoc = upgraded.pdfDoc;
+			session.baseSnapshot = upgraded.baseSnapshot;
+			session.incrementalMode = upgraded.incrementalMode;
+			session.highlightIndex = buildHighlightIndexFromDoc(upgraded.pdfDoc, session.sessionFingerprint);
+			if (mappedTargetOrder && (op.kind === 'recolor' || op.kind === 'set-note' || op.kind === 'remove')) {
+				const order = mappedTargetOrder;
+				const upgradedEntries = session.highlightIndex.get(order.pageIndex) ?? [];
+				const remapped = upgradedEntries.find((entry) =>
+					entry.annotsOrder === order.annotsOrder &&
+					entry.target &&
+					(!order.geometrySignature ||
+						entry.target.geometrySignature === order.geometrySignature),
+				);
+				if (remapped?.target) {
+					return { ...op, target: remapped.target };
+				}
+			}
+		}
+		return op;
 	}
 
 	private assertTargetMatchesSession(session: PdfWorkingSession<File>, target: HighlightTarget): void {
@@ -632,11 +854,13 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		patches: PdfObjectUndoPatch[],
 		visualMode: VisualRefreshMode,
 		onBeforeFinalize: (nextRevision: number) => void,
+		overlayMeta: OverlayUndoMetadata = {},
 	): Promise<SessionMutationResult> {
 		if (session.undoCursor < session.undoStack.length) {
 			session.undoStack.splice(session.undoCursor);
 		}
-		session.undoStack.push({ patches, pageIndexes: changedPageIndexes });
+		const createdRevision = session.revision + 1;
+		session.undoStack.push({ patches, pageIndexes: changedPageIndexes, createdRevision, ...overlayMeta });
 		session.undoCursor++;
 		while (session.undoStack.length > MAX_UNDO_STEPS) {
 			session.undoStack.shift();
@@ -653,6 +877,7 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		changedPageIndexes: number[],
 		visualMode: VisualRefreshMode,
 		onUpdateOverlays: (nextRevision: number) => void,
+		reconcilePendingOverlays = false,
 	): Promise<Omit<SessionMutationResult, 'changed'>> {
 		const nextRevision = session.revision + 1;
 		session.revision = nextRevision;
@@ -669,6 +894,29 @@ export class PdfSessionManager<File extends SessionFileLike> {
 			session.highlightIndex,
 			changedPageIndexes,
 		);
+		if (reconcilePendingOverlays && changedPageIndexes.length > 0 && session.pendingAddedRefs.size > 0) {
+			const touchedPages = new Set(changedPageIndexes);
+			const liveByPage = new Map<number, Map<string, RgbColor | null>>();
+			for (const pageIndex of touchedPages) {
+				const refColors = new Map<string, RgbColor | null>();
+				for (const item of session.highlightIndex.get(pageIndex) ?? []) {
+					if (item.target) refColors.set(targetRefKey(item.target), item.currentColor ?? null);
+				}
+				liveByPage.set(pageIndex, refColors);
+			}
+			for (const [refKey, pending] of session.pendingAddedRefs) {
+				if (!touchedPages.has(pending.pageIndex)) continue;
+				const liveColor = liveByPage.get(pending.pageIndex)?.get(refKey);
+				if (liveColor === undefined) {
+					session.pendingAddedRefs.delete(refKey);
+				} else if (liveColor) {
+					const expectedCss = rgbToCss(liveColor);
+					if (expectedCss !== pending.colorCss) {
+						session.pendingAddedRefs.set(refKey, { ...pending, colorCss: expectedCss, revision: nextRevision });
+					}
+				}
+			}
+		}
 		session.cachedSerialized = null;
 
 		let memoryBytes: Uint8Array | undefined;
@@ -816,45 +1064,27 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				pagesToRefresh: snapshot.pagesToRefresh,
 				flushRevision: snapshot.flushRevision,
 				alreadyVisuallyRefreshed: snapshot.alreadyVisuallyRefreshed,
+				isRevisionCurrent: () => !session.disposed && session.revision === snapshot.flushRevision,
 			});
 
-			session.lastOwnWriteCompletedAt = Date.now();
+			const completedAt = Date.now();
+			session.lastOwnWriteCompletedAt = completedAt;
 			session.lastDiskFingerprint = snapshot.fingerprint;
 			session.lastDiskByteLength = snapshot.bytes.byteLength;
-			session.openedStat = { mtime: session.file.stat.mtime, size: session.file.stat.size };
+			this.pruneRecentOwnWriteSizes(session, completedAt);
+			session.recentOwnWriteByteLengths.set(snapshot.bytes.byteLength, completedAt);
+			session.openedStat = { mtime: session.file.stat.mtime, size: snapshot.bytes.byteLength };
 			session.flushedRevision = Math.max(session.flushedRevision, snapshot.flushRevision);
 			session.acceptedCleanFingerprints.add(snapshot.fingerprint);
 			if (session.cachedSerialized?.revision === snapshot.flushRevision) {
 				session.cachedSerialized = null;
 			}
 
-			this.markPagesVisuallyRefreshed(session, snapshot.pagesToRefresh, snapshot.flushRevision);
-			if (session.revision === snapshot.flushRevision) {
+			if (!session.disposed && session.revision === snapshot.flushRevision) {
+				this.markPagesVisuallyRefreshed(session, snapshot.pagesToRefresh, snapshot.flushRevision);
 				session.dirtyPages.clear();
-				// If an encrypted PDF required a full rewrite on first save, upgrade the
-				// now-decrypted bytes into a fast classic-xref incremental session.
-				if (session.incrementalMode === 'full-rewrite') {
-					await this.enqueueInMemory(session, async () => {
-						if (session.disposed || session.revision !== snapshot.flushRevision) return;
-						const upgraded = await loadPdfDocForSession(snapshot.bytes);
-						if (session.disposed || session.revision !== snapshot.flushRevision) return;
-						session.baseBytes = snapshot.bytes;
-						session.baseFingerprint = snapshot.fingerprint;
-						session.basePrevStartXRef = upgraded.basePrevStartXRef;
-						session.pdfDoc = upgraded.pdfDoc;
-						session.baseSnapshot = upgraded.baseSnapshot;
-						session.incrementalMode = upgraded.incrementalMode;
-						session.sessionFingerprint = snapshot.fingerprint;
-						session.acceptedCleanFingerprints = new Set([snapshot.fingerprint]);
-						session.highlightIndex = buildHighlightIndexFromDoc(upgraded.pdfDoc, snapshot.fingerprint);
-						session.undoStack = [];
-						session.undoCursor = 0;
-						this.adapter.onHistoryChanged?.(session.file, session.path);
-					});
-				}
+				this.adapter.onVisualSynced?.(session.file, session.path, snapshot.flushRevision, snapshot.pagesToRefresh);
 			}
-
-			this.adapter.onVisualSynced?.(session.file, session.path, snapshot.flushRevision, snapshot.pagesToRefresh);
 
 			if (!session.disposed && session.revision > session.flushedRevision) {
 				this.scheduleFlush(session);
@@ -881,6 +1111,8 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		session.pendingAddedRefs.clear();
 		session.cachedSerialized = null;
 		this.sessions.delete(path);
+		this.adapter.onHistoryChanged?.(session.file, session.path);
+		this.adapter.onSessionDropped?.(session.file, session.path);
 	}
 
 	private evictCleanSessionsIfNeeded(incomingPath: string, incomingByteLength: number): void {

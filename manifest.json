@@ -1,7 +1,7 @@
 {
 	"id": "inscribe-pdf",
 	"name": "Inscribe PDF",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"minAppVersion": "1.4.4",
 	"description": "Fast in-file PDF reader and annotator for Obsidian. Writes standard highlights, custom colors, and notes directly into the PDF.",
 	"author": "Rudi Sayat Pulatyan",
