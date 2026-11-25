@@ -752,9 +752,30 @@
 	.study-pdf-toolbar-sidebar .clickable-icon,
 	.study-pdf-toolbar-reading > .pdf-toolbar-left button,
 	.study-pdf-toolbar-reading > .pdf-toolbar-left .clickable-icon { width: 44px; min-width: 44px; min-height: 44px; }
+	.study-pdf-annotation-toolbar .study-pdf-save-status[data-state="saving"] { width: 20px; min-width: 20px; }
 	.study-pdf-toolbar-page .study-pdf-page-trigger { min-width: 52px; min-height: 44px; font-size: 14px; }
 	.study-pdf-page-entry input { height: 44px; }
 	.study-pdf-page-entry .study-pdf-page-go { width: 44px; min-width: 44px; height: 44px; }
+}
+.study-pdf-annotation-toolbar .study-pdf-save-status[hidden] { display: none; }
+.study-pdf-annotation-toolbar .study-pdf-save-status[data-state="saving"] { width: 20px; min-width: 20px; cursor: default; opacity: 1; }
+.study-pdf-annotation-toolbar .study-pdf-save-status[data-state="error"] { cursor: pointer; }
+.study-pdf-save-dot {
+	width: 8px;
+	height: 8px;
+	border-radius: 999px;
+	background-color: var(--interactive-accent);
+}
+.study-pdf-save-status[data-state="saving"] .study-pdf-save-dot {
+	animation: study-pdf-save-pulse 1.2s ease-in-out infinite;
+}
+.study-pdf-save-status[data-state="error"] .study-pdf-save-dot {
+	background-color: var(--text-error);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--text-error) 25%, transparent);
+}
+@keyframes study-pdf-save-pulse {
+	0%, 100% { opacity: 0.35; transform: scale(0.9); }
+	50% { opacity: 1; transform: scale(1.1); }
 }
 
 /* The exact owning PDF leaf is promoted above Obsidian's chrome. Its native

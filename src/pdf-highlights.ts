@@ -67,8 +67,10 @@ export async function collectHighlights(
 	options: CollectHighlightsOptions = {},
 ): Promise<HighlightEntry[]> {
 	const entries: HighlightEntry[] = [];
+	const annotatedPages = storedQuotes.annotatedPageIndexes;
 	for (let pageNumber = 1; pageNumber <= pdfjsDoc.numPages; pageNumber++) {
 		assertScanActive(options.signal);
+		if (annotatedPages && !annotatedPages.has(pageNumber - 1)) continue;
 		const page = await pdfjsDoc.getPage(pageNumber);
 		const annotations = await page.getAnnotations();
 		const pageStoredQuotes = storedQuotes.byAnnotationId.get(pageNumber - 1);
@@ -114,6 +116,9 @@ export async function collectHighlights(
 			await new Promise<void>((resolve) => setTimeout(resolve, 0));
 			assertScanActive(options.signal);
 		}
+	}
+	if (annotatedPages && pdfjsDoc.numPages > 0) {
+		options.onProgress?.(pdfjsDoc.numPages, pdfjsDoc.numPages);
 	}
 	// Reading order: page ascending, then top-of-page first (PDF y grows upward).
 	// Two highlights on the same line tie on `top`; a stable sort leaves them in

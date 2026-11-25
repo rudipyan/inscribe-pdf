@@ -1091,7 +1091,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		try {
 			for (const pdfView of getAllPdfViews(this.app)) {
 				void pdfView.disposeInPlaceUpdates().catch((error) => {
-					console.error('Study PDF: could not release the in-place PDF view state', error);
+					console.error('Inscribe PDF: could not release the in-place PDF view state', error);
 				});
 			}
 		} catch {
@@ -1270,7 +1270,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (!entry?.target) return;
 			this.openAnnotationNote(capture, entry.target, entry.note, position);
 		} catch (error) {
-			if (!this.isUnloading && this.menuGeneration === generation) new Notice(`Study PDF: could not open note -- ${(error as Error).message}`);
+			if (!this.isUnloading && this.menuGeneration === generation) new Notice(`Inscribe PDF: could not open note -- ${(error as Error).message}`);
 		}
 	}
 
@@ -1344,7 +1344,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		}));
 		if (text) {
 			menu.addItem((item) => item.setTitle('Copy').setIcon('copy').onClick(() => {
-				void win?.navigator.clipboard?.writeText(text).catch(() => new Notice('Study PDF: could not copy the selected text.'));
+				void win?.navigator.clipboard?.writeText(text).catch(() => new Notice('Inscribe PDF: could not copy the selected text.'));
 			}));
 		}
 		menu.showAtPosition(position, doc);
@@ -1381,7 +1381,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				});
 				return result.changed;
 			} catch (error) {
-				if (!this.isUnloading) new Notice(`Study PDF: could not save page note — ${(error as Error).message}`);
+				if (!this.isUnloading) new Notice(`Inscribe PDF: could not save page note — ${(error as Error).message}`);
 				return false;
 			}
 		}, 'Page note');
@@ -1690,6 +1690,10 @@ export default class PdfHighlighterPlugin extends Plugin {
 					const view = currentView();
 					if (view) void this.applyPdfHistory(view, 'redo');
 				},
+				onRetrySave: () => {
+					const view = currentView();
+					if (view) void this.pdfSessions?.flushNow(view.file.path).catch(() => {});
+				},
 				onShowHighlights: () => {
 					pendingSelection = null;
 					const view = currentView();
@@ -1768,6 +1772,9 @@ export default class PdfHighlighterPlugin extends Plugin {
 			? this.getPdfHistoryStatus(state.file)
 			: { canUndo: false, canRedo: false };
 		const focus = Array.from(this.pdfFocusModes.values()).find((candidate) => candidate.toolbar === state.toolbar);
+		const saveStatus = state.file
+			? this.pdfSessions?.getSaveStatus(state.file.path)
+			: undefined;
 		state.toolbar.update(
 			this.settings.colors,
 			state.colorId,
@@ -1776,6 +1783,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			Boolean(focus),
 			state.appearance,
 			Boolean(state.regionSelection),
+			saveStatus,
 		);
 	}
 
@@ -2067,17 +2075,17 @@ export default class PdfHighlighterPlugin extends Plugin {
 	private getSelectionContextOrNotify(): SelectionContext | null {
 		const pdfView = getActivePdfView(this.app);
 		if (!pdfView) {
-			new Notice('Study PDF: no PDF is open in the active pane.');
+			new Notice('Inscribe PDF: no PDF is open in the active pane.');
 			return null;
 		}
 		const selection = (pdfView.containerEl.ownerDocument.defaultView ?? window).getSelection();
 		if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
-			new Notice('Study PDF: select some text in the PDF first.');
+			new Notice('Inscribe PDF: select some text in the PDF first.');
 			return null;
 		}
 		const ctx = this.trySelectionContext(pdfView);
 		if (!ctx) {
-			new Notice('Study PDF: could not capture the full selection. Try a contiguous selection through rendered page text.');
+			new Notice('Inscribe PDF: could not capture the full selection. Try a contiguous selection through rendered page text.');
 			return null;
 		}
 		return ctx;
@@ -2181,7 +2189,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			const index = await buildHighlightIndex(new Uint8Array(bytes));
 			this.assertCapturedPdfCurrent(capture);
 			if (generation !== this.highlightIndexGeneration || key !== this.pdfRevisionKey(file)) {
-				throw new Error('Study PDF: the PDF changed while inspecting annotations. Click it again.');
+				throw new Error('Inscribe PDF: the PDF changed while inspecting annotations. Click it again.');
 			}
 			this.highlightIndex = { key, file, index };
 			return index;
@@ -2757,7 +2765,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		const { capture } = click;
 		const pdfView = capture.pdfView;
 		if (!this.isCapturedPdfCurrent(capture)) {
-			if (notify) new Notice('Study PDF: the PDF where you clicked is no longer open at that location.');
+			if (notify) new Notice('Inscribe PDF: the PDF where you clicked is no longer open at that location.');
 			return null;
 		}
 		const resolved = resolveCapturedPdfPress(click);
@@ -2769,7 +2777,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 			const infos = findHighlightsInIndexAtPoint(index, resolved.pageIndex, resolved.point)
 				.filter((info) => !areaInteraction?.regionsOnly || Boolean(info.regionBox));
 			if (!infos.length) {
-				if (notify) new Notice('Study PDF: no highlight found where you clicked.');
+				if (notify) new Notice('Inscribe PDF: no highlight found where you clicked.');
 				return false;
 			}
 			// A delayed index build must not move an earlier press onto a later pane
@@ -2792,7 +2800,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		} catch (error) {
 			// Silent: this is a passive background check, not an explicit user action.
 			if (notify && !this.isUnloading && menuGeneration === this.menuGeneration) {
-				new Notice(`Study PDF: could not inspect highlights -- ${(error as Error).message}`, 0);
+				new Notice(`Inscribe PDF: could not inspect highlights -- ${(error as Error).message}`, 0);
 			}
 			return null;
 		}
@@ -2825,7 +2833,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				() => !this.isUnloading && this.isCapturedPdfCurrent(capture)).then(
 				() => {
 					if (dismiss) {
-						new Notice('Study PDF: copied highlighted text to the clipboard.');
+						new Notice('Inscribe PDF: copied highlighted text to the clipboard.');
 						if (this.activePopup === popup) popup.hide();
 					}
 				},
@@ -2880,16 +2888,18 @@ export default class PdfHighlighterPlugin extends Plugin {
 				pdfView,
 				coordinator: this.pdfMutationCoordinator,
 				read: () => this.app.vault.readBinary(capture.file),
+				readStoredQuotes: (_snapshot, fingerprint, signal) =>
+					this.pdfSessions?.getStoredQuotesForFingerprint(capture.path, fingerprint, { signal }) ?? Promise.resolve(null),
 				assertCurrent: () => this.assertCapturedPdfCurrent(capture),
 			}, async (entries, _snapshotFingerprint, assertSourceUnchanged) => {
 				const notePath = exportNotePath(pdfView.file.parent?.path, pdfView.file.basename);
 				const existingFile = this.app.vault.getAbstractFileByPath(notePath);
 				if (entries.length === 0 && !existingFile) {
-					new Notice('Study PDF: no highlights in this PDF yet.');
+					new Notice('Inscribe PDF: no highlights in this PDF yet.');
 					return;
 				}
 				if (existingFile && !(existingFile instanceof TFile)) {
-					new Notice(`Study PDF: "${notePath}" is a folder, not a note.`);
+					new Notice(`Inscribe PDF: "${notePath}" is a folder, not a note.`);
 					return;
 				}
 				const link = (subpath: string, alias?: string) =>
@@ -2911,7 +2921,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				new Notice(`Exported ${entries.length} highlight${entries.length === 1 ? '' : 's'} to ${notePath}.`);
 			});
 		} catch (err) {
-			new Notice(`Study PDF: could not export highlights — ${(err as Error).message}`);
+			new Notice(`Inscribe PDF: could not export highlights — ${(err as Error).message}`);
 		}
 	}
 
@@ -2941,7 +2951,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				const notePath = selectionExportNotePath(pdfView.file.parent?.path, pdfView.file.basename);
 				const existingFile = this.app.vault.getAbstractFileByPath(notePath);
 				if (existingFile && !(existingFile instanceof TFile)) {
-					new Notice(`Study PDF: "${notePath}" is a folder, not a note.`);
+					new Notice(`Inscribe PDF: "${notePath}" is a folder, not a note.`);
 					return;
 				}
 				const link = (subpath: string, alias?: string) =>
@@ -2964,7 +2974,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				new Notice(`Exported ${entries.length} selected highlight${entries.length === 1 ? '' : 's'} to ${notePath}.`);
 			});
 		} catch (err) {
-			new Notice(`Study PDF: could not export selected highlights — ${(err as Error).message}`);
+			new Notice(`Inscribe PDF: could not export selected highlights — ${(err as Error).message}`);
 		}
 	}
 
@@ -2982,17 +2992,19 @@ export default class PdfHighlighterPlugin extends Plugin {
 				pdfView,
 				coordinator: this.pdfMutationCoordinator,
 				read: () => this.app.vault.readBinary(capture.file),
+				readStoredQuotes: (_snapshot, fingerprint, signal) =>
+					this.pdfSessions?.getStoredQuotesForFingerprint(capture.path, fingerprint, { signal }) ?? Promise.resolve(null),
 				assertCurrent: () => this.assertCapturedPdfCurrent(capture),
 			}, async (entries, _snapshotFingerprint, assertSourceUnchanged) => {
 				const notePath = siblingNotePath(pdfView.file.parent?.path, pdfView.file.basename, 'flashcards');
 				const existingFile = this.app.vault.getAbstractFileByPath(notePath);
 				const withNotes = entries.filter((entry) => !entry.standaloneNote && (entry.note ?? '').trim().length > 0);
 				if (withNotes.length === 0 && !existingFile) {
-					new Notice('Study PDF: add a note to a highlight first — the note becomes the question.');
+					new Notice('Inscribe PDF: add a note to a highlight first — the note becomes the question.');
 					return;
 				}
 				if (existingFile && !(existingFile instanceof TFile)) {
-					new Notice(`Study PDF: "${notePath}" is a folder, not a note.`);
+					new Notice(`Inscribe PDF: "${notePath}" is a folder, not a note.`);
 					return;
 				}
 				const blocks = buildFlashcardBlocks(withNotes.map((entry) => ({
@@ -3028,10 +3040,10 @@ export default class PdfHighlighterPlugin extends Plugin {
 				if (merged.updated > 0) parts.push(`${merged.updated} updated`);
 				if (merged.kept > 0) parts.push(`${merged.kept} already there`);
 				if (merged.orphaned > 0) parts.push(`${merged.orphaned} moved to "Orphaned" (highlight gone; review history kept)`);
-				new Notice(`Study PDF: ${parts.join(', ')} in ${notePath}.`);
+				new Notice(`Inscribe PDF: ${parts.join(', ')} in ${notePath}.`);
 			});
 		} catch (err) {
-			new Notice(`Study PDF: could not sync flashcards — ${(err as Error).message}`);
+			new Notice(`Inscribe PDF: could not sync flashcards — ${(err as Error).message}`);
 		}
 	}
 
@@ -3058,7 +3070,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		const { capture, pdfView, segments } = ctx;
 		if (this.isUnloading) return;
 		if (!this.isCapturedPdfCurrent(capture)) {
-			new Notice('Study PDF: the PDF view changed before this highlight could be saved.');
+			new Notice('Inscribe PDF: the PDF view changed before this highlight could be saved.');
 			return;
 		}
 		const ownerDocument = pdfView.containerEl.ownerDocument;
@@ -3182,8 +3194,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		} catch (err) {
 			this.invalidateHighlightIndex();
 			if (this.isUnloading || action.signal.aborted) return;
-			console.error('Study PDF: failed to add highlight', err);
-			new Notice(`Study PDF: failed to add highlight -- ${(err as Error).message}`, 0);
+			console.error('Inscribe PDF: failed to add highlight', err);
+			new Notice(`Inscribe PDF: failed to add highlight -- ${(err as Error).message}`, 0);
 		} finally {
 			try { preview?.dispose(); } catch { /* Preview cleanup must not retain the action lifecycle. */ }
 			if (preview) this.pendingPreviews.delete(preview);
@@ -3198,7 +3210,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 	private async removeHighlightAtLastClick() {
 		const click = this.lastPdfClick;
 		if (!click) {
-			new Notice('Study PDF: click on a highlight first.');
+			new Notice('Inscribe PDF: click on a highlight first.');
 			return;
 		}
 		await this.showCandidatesForClick(click, true);
@@ -3210,7 +3222,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		color: RgbColor,
 	) {
 		if (!this.isCapturedPdfCurrent(capture)) {
-			new Notice('Study PDF: the PDF view changed before this color could be saved.');
+			new Notice('Inscribe PDF: the PDF view changed before this color could be saved.');
 			return;
 		}
 		this.hideActiveMenu();
@@ -3228,8 +3240,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		} catch (err) {
 			this.invalidateHighlightIndex();
 			if (this.isUnloading) return;
-			console.error('Study PDF: failed to change highlight color', err);
-			new Notice(`Study PDF: could not change highlight color -- ${(err as Error).message}`, 0);
+			console.error('Inscribe PDF: failed to change highlight color', err);
+			new Notice(`Inscribe PDF: could not change highlight color -- ${(err as Error).message}`, 0);
 		}
 	}
 
@@ -3239,7 +3251,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		note: string,
 	): Promise<boolean> {
 		if (!this.isCapturedPdfCurrent(capture)) {
-			new Notice('Study PDF: the PDF view changed before this note could be saved.');
+			new Notice('Inscribe PDF: the PDF view changed before this note could be saved.');
 			return false;
 		}
 		try {
@@ -3264,8 +3276,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 		} catch (err) {
 			this.invalidateHighlightIndex();
 			if (this.isUnloading) return false;
-			console.error('Study PDF: failed to save note', err);
-			new Notice(`Study PDF: could not save note -- ${(err as Error).message}`, 0);
+			console.error('Inscribe PDF: failed to save note', err);
+			new Notice(`Inscribe PDF: could not save note -- ${(err as Error).message}`, 0);
 			return false;
 		}
 	}
@@ -3275,7 +3287,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		target: HighlightTarget,
 	) {
 		if (!this.isCapturedPdfCurrent(capture)) {
-			new Notice('Study PDF: the PDF view changed before this highlight could be removed.');
+			new Notice('Inscribe PDF: the PDF view changed before this highlight could be removed.');
 			return;
 		}
 		this.hideActiveMenu();
@@ -3284,7 +3296,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				const result = await this.pdfSessions.mutate(capture.file, { kind: 'remove', target });
 				if (this.isUnloading) return;
 				if (!result.changed) {
-					new Notice('Study PDF: the selected highlight is no longer present.');
+					new Notice('Inscribe PDF: the selected highlight is no longer present.');
 				} else {
 					this.applySessionVisualResult(capture.file, result);
 				}
@@ -3296,13 +3308,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 			});
 			if (this.isUnloading) return;
 			if (!result.changed || result.value === 0) {
-				new Notice('Study PDF: the selected highlight is no longer present.');
+				new Notice('Inscribe PDF: the selected highlight is no longer present.');
 			}
 		} catch (err) {
 			this.invalidateHighlightIndex();
 			if (this.isUnloading) return;
-			console.error('Study PDF: failed to remove highlight', err);
-			new Notice(`Study PDF: could not remove highlight -- ${(err as Error).message}`, 0);
+			console.error('Inscribe PDF: failed to remove highlight', err);
+			new Notice(`Inscribe PDF: could not remove highlight -- ${(err as Error).message}`, 0);
 		}
 	}
 
@@ -3321,8 +3333,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			} catch (error) {
 				if (this.isUnloading) return;
 				this.refreshAnnotationToolbars();
-				console.error(`Study PDF: failed to ${direction} PDF annotation`, error);
-				new Notice(`Study PDF: could not ${direction} PDF annotation -- ${(error as Error).message}`, 0);
+				console.error(`Inscribe PDF: failed to ${direction} PDF annotation`, error);
+				new Notice(`Inscribe PDF: could not ${direction} PDF annotation -- ${(error as Error).message}`, 0);
 				return;
 			}
 		}
@@ -3349,13 +3361,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 			if (this.isUnloading) return;
 			this.refreshAnnotationToolbars();
 			if (result.value.status === 'mismatch') {
-				new Notice('Study PDF: the PDF no longer matches its undo history. History was cleared without changing the file.');
+				new Notice('Inscribe PDF: the PDF no longer matches its undo history. History was cleared without changing the file.');
 			}
 		} catch (error) {
 			if (this.isUnloading) return;
 			this.refreshAnnotationToolbars();
-			console.error(`Study PDF: failed to ${direction} PDF annotation`, error);
-			new Notice(`Study PDF: could not ${direction} PDF annotation -- ${(error as Error).message}`, 0);
+			console.error(`Inscribe PDF: failed to ${direction} PDF annotation`, error);
+			new Notice(`Inscribe PDF: could not ${direction} PDF annotation -- ${(error as Error).message}`, 0);
 		}
 	}
 
@@ -3371,7 +3383,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 		const previewByView = new Map<HTMLElement, PdfUpdatePreview>();
 		let activePageIndexes = Array.isArray(pageIndexes) ? pageIndexes : [];
 		const assertMutationActive = () => {
-			if (this.isUnloading) throw createMutationAbortError('Study PDF is unloading.');
+			if (this.isUnloading) throw createMutationAbortError('Inscribe PDF is unloading.');
 			if (actionSignal?.aborted) {
 				throw actionSignal.reason instanceof Error
 					? actionSignal.reason
@@ -3495,13 +3507,13 @@ export default class PdfHighlighterPlugin extends Plugin {
 						} else {
 							const recorded = this.annotationHistory.record(capture.file, capture.path, beforeBytes, bytes, activePageIndexes);
 							if (recorded.status === 'too-large') {
-								new Notice('Study PDF: this PDF is too large to fit one undo step in memory.');
+								new Notice('Inscribe PDF: this PDF is too large to fit one undo step in memory.');
 							}
 						}
 					} catch (error) {
 						this.annotationHistory.clearPath(capture.path);
-						console.error('Study PDF: could not update in-memory undo history after saving', error);
-						new Notice('Study PDF: the PDF was saved, but its undo history could not be kept in memory.');
+						console.error('Inscribe PDF: could not update in-memory undo history after saving', error);
+						new Notice('Inscribe PDF: the PDF was saved, but its undo history could not be kept in memory.');
 					}
 				}
 				if (!this.isUnloading) this.refreshAnnotationToolbars();
@@ -3540,8 +3552,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 						fallbackItem.curtain?.cancel();
 						fallbackItem.position?.cancel();
 						if (this.isUnloading) return;
-						console.error('Study PDF: saved annotations but could not refresh the PDF view', error);
-						new Notice('Study PDF: annotations were saved. Reopen the PDF to refresh its view.');
+						console.error('Inscribe PDF: saved annotations but could not refresh the PDF view', error);
+						new Notice('Inscribe PDF: annotations were saved. Reopen the PDF to refresh its view.');
 					}
 					if (this.isUnloading) disposeOwnedResources();
 				}));
@@ -3590,6 +3602,8 @@ export default class PdfHighlighterPlugin extends Plugin {
 			this.pdfMutationCoordinator,
 			() => this.exportHighlightsToNote(pdfView),
 			(entries, snapshotFingerprint) => this.exportSelectedHighlightsToNote(pdfView, entries, snapshotFingerprint),
+			(_snapshot, fingerprint, signal) =>
+				this.pdfSessions?.getStoredQuotesForFingerprint(pdfView.file.path, fingerprint, { signal }) ?? Promise.resolve(null),
 		).open();
 	}
 
@@ -3608,17 +3622,20 @@ export default class PdfHighlighterPlugin extends Plugin {
 				this.invalidateHighlightIndex();
 				this.refreshAnnotationToolbars();
 				if (this.isUnloading) return;
-				new Notice(`Study PDF: ${reason}`, 0);
+				new Notice(`Inscribe PDF: ${reason}`, 0);
 				for (const view of getAllPdfViews(this.app).filter((candidate) => candidate.file === file || candidate.file.path === path)) {
 					try { await view.forceReload(); } catch { /* Best-effort reload on conflict. */ }
 				}
 			},
 			onFlushError: (_file, _path, error) => {
 				if (this.isUnloading) return;
-				console.error('Study PDF: background PDF save failed', error);
-				new Notice(`Study PDF: could not save PDF changes -- ${(error as Error).message}`, 0);
+				console.error('Inscribe PDF: background PDF save failed', error);
+				new Notice(`Inscribe PDF: could not save PDF changes -- ${(error as Error).message}`, 0);
 			},
 			onHistoryChanged: () => {
+				if (!this.isUnloading) this.refreshAnnotationToolbars();
+			},
+			onSaveStatusChanged: () => {
 				if (!this.isUnloading) this.refreshAnnotationToolbars();
 			},
 			onSessionDropped: (_file, path) => {
@@ -3731,7 +3748,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 					curtain?.cancel();
 					position?.cancel();
 					if (!this.isUnloading) {
-						console.error('Study PDF: saved annotations but could not refresh the PDF view', error);
+						console.error('Inscribe PDF: saved annotations but could not refresh the PDF view', error);
 					}
 				}
 			}));
@@ -3788,8 +3805,10 @@ export default class PdfHighlighterPlugin extends Plugin {
 	}
 
 	private schedulePdfSessionPrewarm(file: TFile): void {
-		if (this.isUnloading || Platform.isIosApp || !this.pdfSessions) return;
-		if (file.stat.size > 100 * 1024 * 1024) return;
+		if (this.isUnloading || !this.pdfSessions) return;
+		const maxPrewarmBytes = Platform.isIosApp ? 25 * 1024 * 1024 : 100 * 1024 * 1024;
+		if (file.stat.size > maxPrewarmBytes) return;
+		const delayMs = Platform.isIosApp ? 1500 : 800;
 		window.clearTimeout(this.sessionPrewarmTimer);
 		this.sessionPrewarmTimer = window.setTimeout(() => {
 			this.sessionPrewarmTimer = 0;
@@ -3801,7 +3820,7 @@ export default class PdfHighlighterPlugin extends Plugin {
 				return;
 			}
 			void this.pdfSessions.warmSession(file).catch(() => {});
-		}, 800);
+		}, delayMs);
 	}
 
 	private ensurePendingOverlayForView(view: ActivePdfView): PendingHighlightOverlay {

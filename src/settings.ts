@@ -58,7 +58,7 @@ export class PdfHighlighterSettingTab extends PluginSettingTab {
 		if (!this.paletteEditor) {
 			this.paletteEditor = new PaletteEditorSession(this.host, (error) => {
 				const detail = error instanceof Error ? error.message : String(error);
-				new Notice(`Study PDF: could not save highlight colors — ${detail}`);
+				new Notice(`Inscribe PDF: could not save highlight colors — ${detail}`);
 			});
 		}
 		return this.paletteEditor;

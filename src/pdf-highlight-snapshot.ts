@@ -3,6 +3,7 @@ import { createPdfJsDocumentSnapshot } from './obsidian-pdf-internals';
 import { bytesEqual, type PdfMutationCoordinator } from './pdf-mutation';
 import type { HighlightEntry, PdfJsDocument } from './pdf-highlights';
 import { collectHighlights } from './pdf-highlights';
+import type { StoredQuotesByReference } from './annotate';
 import { getStoredQuotes } from './annotate';
 import { fingerprintPdfBytes } from './pdf-in-place';
 
@@ -11,6 +12,7 @@ export interface PdfHighlightSnapshotOptions {
 	pdfView: ActivePdfView;
 	coordinator: PdfMutationCoordinator;
 	read(): Promise<Uint8Array | ArrayBuffer>;
+	readStoredQuotes?(snapshot: Uint8Array, fingerprint: string, signal?: AbortSignal): Promise<StoredQuotesByReference | null>;
 	assertCurrent(): void;
 	signal?: AbortSignal;
 	onProgress?: (pageNumber: number, pageCount: number) => void;
@@ -73,7 +75,10 @@ export async function withPdfHighlightSnapshot<T>(
 				scanController.abort();
 				throw error;
 			});
-			const storedQuotesPromise = getStoredQuotes(snapshot, { signal: scanController.signal }).catch((error) => {
+			const storedQuotesPromise = (async () => {
+				const fast = await options.readStoredQuotes?.(snapshot, snapshotFingerprint, scanController.signal);
+				return fast ?? await getStoredQuotes(snapshot, { signal: scanController.signal });
+			})().catch((error) => {
 				documentSnapshot.cancel();
 				throw error;
 			});

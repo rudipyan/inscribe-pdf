@@ -19,6 +19,7 @@ export interface AnnotationToolbar {
 		focusActive: boolean,
 		appearance: PdfReadingAppearance,
 		areaSelecting?: boolean,
+		saveStatus?: { status: 'idle' | 'saving' | 'error'; errorMessage?: string },
 	): void;
 	destroy(): void;
 }
@@ -71,6 +72,7 @@ export function createAnnotationToolbar(
 		onCancel: () => void;
 		onUndo: () => void;
 		onRedo: () => void;
+		onRetrySave?: () => void;
 		onShowHighlights: () => void;
 		onFocus: () => void;
 		onAppearance: (anchor: HTMLButtonElement) => IconPopup | null;
@@ -197,6 +199,14 @@ export function createAnnotationToolbar(
 		pomodoroPopup = actions.onPomodoro?.(anchor) ?? null;
 	}) : null;
 	if (pomodoro) pinned.prepend(pomodoro.button);
+	const saveStatusEl = pinned.createEl('button', { cls: 'clickable-icon study-pdf-tool-button study-pdf-save-status' });
+	saveStatusEl.type = 'button';
+	saveStatusEl.hidden = true;
+	const saveDot = saveStatusEl.createSpan({ cls: 'study-pdf-save-dot' });
+	saveDot.setAttribute('aria-hidden', 'true');
+	saveStatusEl.addEventListener('click', () => {
+		if (saveStatusEl.dataset.state === 'error') actions.onRetrySave?.();
+	});
 	const focus = createButton(pinned, 'maximize-2', 'Full screen', 'study-pdf-action-button study-pdf-action-focus', actions.onFocus);
 	const overviewSeparator = pinned.createDiv({ cls: 'study-pdf-toolbar-separator' });
 	overviewSeparator.setAttribute('aria-hidden', 'true');
@@ -219,7 +229,7 @@ export function createAnnotationToolbar(
 	return {
 		el,
 		focusButton: focus,
-		update(colors, colorId, highlighting, historyStatus, focusActive, readingAppearance, areaSelecting = false) {
+		update(colors, colorId, highlighting, historyStatus, focusActive, readingAppearance, areaSelecting = false, saveStatus = { status: 'idle' }) {
 			const nextSignature = JSON.stringify(colors);
 			if (signature !== nextSignature) {
 				signature = nextSignature;
@@ -255,6 +265,26 @@ export function createAnnotationToolbar(
 			const label = `Reading appearance: ${appearanceLabel}`;
 			appearance.setAttribute('aria-label', label);
 			setTooltip(appearance, label);
+			if (saveStatus.status === 'idle') {
+				saveStatusEl.hidden = true;
+				saveStatusEl.disabled = true;
+				delete saveStatusEl.dataset.state;
+			} else if (saveStatus.status === 'saving') {
+				saveStatusEl.hidden = false;
+				saveStatusEl.disabled = true;
+				saveStatusEl.dataset.state = 'saving';
+				saveStatusEl.setAttribute('aria-label', 'Saving annotations…');
+				setTooltip(saveStatusEl, 'Saving annotations…');
+			} else {
+				saveStatusEl.hidden = false;
+				saveStatusEl.disabled = false;
+				saveStatusEl.dataset.state = 'error';
+				const errorLabel = saveStatus.errorMessage
+					? `Save failed: ${saveStatus.errorMessage}. Click to retry.`
+					: 'Save failed. Click to retry.';
+				saveStatusEl.setAttribute('aria-label', 'Could not save annotations. Click to retry.');
+				setTooltip(saveStatusEl, errorLabel);
+			}
 		},
 		destroy() {
 			pageNavigation?.destroy();

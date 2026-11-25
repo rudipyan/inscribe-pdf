@@ -4,6 +4,7 @@ import {
 	addPageNoteToDoc,
 	applyUndoPatchToDoc,
 	buildHighlightIndexFromDoc,
+	getStoredQuotesFromDoc,
 	loadPdfDocForSession,
 	recolorHighlightInDoc,
 	reinspectHighlightTargetInDoc,
@@ -19,6 +20,8 @@ import {
 	type IncrementalSaveMode,
 	type PdfObjectUndoPatch,
 	type RgbColor,
+	type StoredQuotesByReference,
+	type StoredQuotesOptions,
 } from './annotate';
 import { fingerprintPdfBytes } from './pdf-in-place';
 import { normalizeVaultRelativePath } from './pdf-mutation';
@@ -88,6 +91,13 @@ export interface PdfSessionWriteContext {
 	isRevisionCurrent(): boolean;
 }
 
+export type PdfSaveStatus = 'idle' | 'saving' | 'error';
+
+export interface PdfSaveStatusSnapshot {
+	status: PdfSaveStatus;
+	errorMessage?: string;
+}
+
 export interface PdfSessionAdapter<File extends SessionFileLike> {
 	readBinary(file: File): Promise<Uint8Array>;
 	writeBinary(file: File, bytes: Uint8Array, context: PdfSessionWriteContext): Promise<void>;
@@ -95,6 +105,7 @@ export interface PdfSessionAdapter<File extends SessionFileLike> {
 	onExternalConflict(file: File, path: string, reason: string): Promise<void> | void;
 	onFlushError?(file: File, path: string, error: unknown): void;
 	onHistoryChanged?(file: File, path: string): void;
+	onSaveStatusChanged?(file: File, path: string): void;
 	onSessionDropped?(file: File, path: string): void;
 	onVisualSynced?(file: File, path: string, flushRevision: number, refreshedPages: number[]): void;
 }
@@ -145,6 +156,7 @@ interface PdfWorkingSession<File extends SessionFileLike> {
 	inMemoryQueue: Promise<void>;
 	flushQueue: Promise<void>;
 	isFlushing: boolean;
+	lastFlushError: string | null;
 	lastOwnWriteCompletedAt: number;
 	lastUsed: number;
 	disposed: boolean;
@@ -230,6 +242,38 @@ export class PdfSessionManager<File extends SessionFileLike> {
 			canUndo: session.undoCursor > 0,
 			canRedo: session.undoCursor < session.undoStack.length,
 		};
+	}
+
+	getSaveStatus(path: string): PdfSaveStatusSnapshot {
+		const session = this.sessions.get(normalizeVaultRelativePath(path));
+		if (!session || session.disposed) return { status: 'idle' };
+		if (session.lastFlushError !== null) {
+			return { status: 'error', errorMessage: session.lastFlushError };
+		}
+		if (session.isFlushing || session.revision > session.flushedRevision) {
+			return { status: 'saving' };
+		}
+		return { status: 'idle' };
+	}
+
+	async getStoredQuotesForFingerprint(
+		path: string,
+		fingerprint: string,
+		options?: StoredQuotesOptions,
+	): Promise<StoredQuotesByReference | null> {
+		const key = normalizeVaultRelativePath(path);
+		const session = this.sessions.get(key);
+		if (!session || session.disposed || session.revision > session.flushedRevision ||
+			session.lastDiskFingerprint !== fingerprint) {
+			return null;
+		}
+		return this.enqueueInMemory(session, async () => {
+			if (session.disposed || session.revision > session.flushedRevision ||
+				session.lastDiskFingerprint !== fingerprint) {
+				return null;
+			}
+			return getStoredQuotesFromDoc(session.pdfDoc, options);
+		});
 	}
 
 	async warmSession(file: File): Promise<void> {
@@ -742,6 +786,7 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				inMemoryQueue: Promise.resolve(),
 				flushQueue: Promise.resolve(),
 				isFlushing: false,
+				lastFlushError: null,
 				lastOwnWriteCompletedAt: -Infinity,
 				lastUsed: ++this.useCounter,
 				disposed: false,
@@ -833,7 +878,7 @@ export class PdfSessionManager<File extends SessionFileLike> {
 			session.acceptedCleanFingerprints.has(target.sourceFingerprint)) {
 			return;
 		}
-		throw new Error('Study PDF: highlight target belongs to an earlier PDF state. Click the highlight again before changing it.');
+		throw new Error('Inscribe PDF: highlight target belongs to an earlier PDF state. Click the highlight again before changing it.');
 	}
 
 	private resolveTargetForNote(session: PdfWorkingSession<File>, target: HighlightTarget): HighlightTarget {
@@ -932,6 +977,7 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		}
 
 		this.scheduleFlush(session);
+		this.adapter.onSaveStatusChanged?.(session.file, session.path);
 
 		return {
 			revision: nextRevision,
@@ -1041,6 +1087,8 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		if (!snapshot || session.disposed) return;
 
 		session.isFlushing = true;
+		session.lastFlushError = null;
+		this.adapter.onSaveStatusChanged?.(session.file, session.path);
 		try {
 			// Verify the on-disk file was not modified externally (e.g. from iPad via iCloud).
 			const diskRaw = await this.adapter.readBinary(session.file);
@@ -1086,10 +1134,16 @@ export class PdfSessionManager<File extends SessionFileLike> {
 				this.adapter.onVisualSynced?.(session.file, session.path, snapshot.flushRevision, snapshot.pagesToRefresh);
 			}
 
+			session.isFlushing = false;
+			if (!session.disposed) this.adapter.onSaveStatusChanged?.(session.file, session.path);
+
 			if (!session.disposed && session.revision > session.flushedRevision) {
 				this.scheduleFlush(session);
 			}
 		} catch (error) {
+			session.isFlushing = false;
+			session.lastFlushError = error instanceof Error ? error.message : String(error);
+			if (!session.disposed) this.adapter.onSaveStatusChanged?.(session.file, session.path);
 			this.adapter.onFlushError?.(session.file, session.path, error);
 			throw error;
 		} finally {
@@ -1112,6 +1166,7 @@ export class PdfSessionManager<File extends SessionFileLike> {
 		session.cachedSerialized = null;
 		this.sessions.delete(path);
 		this.adapter.onHistoryChanged?.(session.file, session.path);
+		this.adapter.onSaveStatusChanged?.(session.file, session.path);
 		this.adapter.onSessionDropped?.(session.file, session.path);
 	}
 

@@ -170,7 +170,7 @@ export interface ActivePdfView {
 }
 
 const INTERNALS_ERROR =
-	'Study PDF: could not find the PDF viewer internals on this version of Obsidian. ' +
+	'Inscribe PDF: could not find the PDF viewer internals on this version of Obsidian. ' +
 	'This plugin relies on an undocumented internal API that may have changed -- please report this issue.';
 
 // Minimal local shapes for the live, untyped pdf.js objects reached through
@@ -461,10 +461,10 @@ function scheduleNotificationRecheck(state: InPlacePdfViewState): void {
 		try {
 			const result = state.guardedOnLoadFile?.call(state.rawView, file);
 			void Promise.resolve(result).catch((error) => {
-				console.warn('Study PDF: could not recheck a PDF reload notification', error);
+				console.warn('Inscribe PDF: could not recheck a PDF reload notification', error);
 			});
 		} catch (error) {
-			console.warn('Study PDF: could not recheck a PDF reload notification', error);
+			console.warn('Inscribe PDF: could not recheck a PDF reload notification', error);
 		}
 	});
 }
@@ -765,7 +765,7 @@ async function applyPdfJsDocumentRefresh(options: {
 					pageView.detailView.update({ underlyingViewUpdated: true });
 				}
 			} catch (error) {
-				console.warn('Study PDF: could not refresh the page annotation layer', error);
+				console.warn('Inscribe PDF: could not refresh the page annotation layer', error);
 				return !isCurrent() ? 'superseded' : 'unavailable';
 			}
 		}
@@ -1288,7 +1288,7 @@ function buildPdfView(leaf: WorkspaceLeaf, app: App): ActivePdfView | null {
 
 		async prepareInPlacePdfWrite(bytes: Uint8Array, outputFingerprint?: string): Promise<InPlacePdfWriteToken | null> {
 			if (!canRefreshInPlace(view)) {
-				console.warn('Study PDF: this viewer does not expose the required in-place refresh APIs.');
+				console.warn('Inscribe PDF: this viewer does not expose the required in-place refresh APIs.');
 				return null;
 			}
 			const state = installInPlaceReloadGuard(view, app);
@@ -1304,7 +1304,7 @@ function buildPdfView(leaf: WorkspaceLeaf, app: App): ActivePdfView | null {
 				state.latestExpectation = { writeId, fingerprint, startedAt: Date.now(), writePending: true };
 				return { fingerprint, generation, writeId };
 			} catch (error) {
-				console.warn('Study PDF: could not prepare an in-place PDF update', error);
+				console.warn('Inscribe PDF: could not prepare an in-place PDF update', error);
 				return null;
 			}
 		},

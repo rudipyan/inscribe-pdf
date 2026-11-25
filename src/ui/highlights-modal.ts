@@ -9,7 +9,7 @@
 import { Modal, Notice, setTooltip, type App } from 'obsidian';
 import { getAllPdfViews, type ActivePdfView } from '../obsidian-pdf-internals';
 import { capturePdfTarget, isCapturedPdfCurrent, isCapturedPdfViewLive, type CapturedPdfTarget, type PdfMutationCoordinator } from '../pdf-mutation';
-import { withPdfHighlightSnapshot } from '../pdf-highlight-snapshot';
+import { withPdfHighlightSnapshot, type PdfHighlightSnapshotOptions } from '../pdf-highlight-snapshot';
 import { excerptQuote } from '../pdf-text-extraction';
 import type { HighlightEntry } from '../pdf-highlights';
 import { formatQuoteBlock } from '../highlight-export';
@@ -21,6 +21,7 @@ export class HighlightListModal extends Modal {
 	private readonly onExport: () => Promise<void>;
 	private readonly onExportSelection: (entries: HighlightEntry[], snapshotFingerprint: string) => Promise<void>;
 	private readonly coordinator: PdfMutationCoordinator;
+	private readonly readStoredQuotes?: PdfHighlightSnapshotOptions['readStoredQuotes'];
 	private readonly capture: CapturedPdfTarget<ActivePdfView['file'], ActivePdfView>;
 	private closed = false;
 	private scanController: AbortController | null = null;
@@ -32,12 +33,14 @@ export class HighlightListModal extends Modal {
 		coordinator: PdfMutationCoordinator,
 		onExport: () => Promise<void>,
 		onExportSelection: (entries: HighlightEntry[], snapshotFingerprint: string) => Promise<void>,
+		readStoredQuotes?: PdfHighlightSnapshotOptions['readStoredQuotes'],
 	) {
 		super(app);
 		this.pdfView = pdfView;
 		this.coordinator = coordinator;
 		this.onExport = onExport;
 		this.onExportSelection = onExportSelection;
+		this.readStoredQuotes = readStoredQuotes;
 		this.capture = capturePdfTarget(pdfView.file, pdfView);
 	}
 
@@ -61,6 +64,7 @@ export class HighlightListModal extends Modal {
 				pdfView: this.pdfView,
 				coordinator: this.coordinator,
 				read: () => this.app.vault.readBinary(this.pdfView.file),
+				readStoredQuotes: this.readStoredQuotes,
 				assertCurrent: () => this.assertCurrent(),
 				signal: controller.signal,
 				onProgress: (pageNumber, pageCount) => {

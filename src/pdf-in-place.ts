@@ -49,7 +49,7 @@ export async function refreshPageCanvas(
 	const width = canvas.width;
 	const height = canvas.height;
 	const size = viewport as { width?: number; height?: number; scale?: number; rotation?: number } | null;
-	if (!size?.width || !size.height) throw new Error('Study PDF: could not read the page dimensions.');
+	if (!size?.width || !size.height) throw new Error('Inscribe PDF: could not read the page dimensions.');
 	const viewportWidth = size.width;
 	const viewportHeight = size.height;
 	const viewportScale = size.scale;
@@ -69,7 +69,7 @@ export async function refreshPageCanvas(
 		size.width === viewportWidth && size.height === viewportHeight &&
 		size.scale === viewportScale && size.rotation === viewportRotation;
 	const context = canvas.getContext('2d');
-	if (!context) throw new Error('Study PDF: could not create a page drawing context.');
+	if (!context) throw new Error('Inscribe PDF: could not create a page drawing context.');
 	const copyRaster = (raster: HTMLCanvasElement) => {
 		context.save();
 		try {
@@ -85,20 +85,20 @@ export async function refreshPageCanvas(
 		return;
 	}
 	if (!updatedPage.render || !pageView._getRenderingContext) {
-		throw new Error('Study PDF: this PDF viewer cannot redraw one page safely.');
+		throw new Error('Inscribe PDF: this PDF viewer cannot redraw one page safely.');
 	}
 	const scratch = canvas.ownerDocument.createElement('canvas');
 	scratch.width = width;
 	scratch.height = height;
 	try {
 		const scratchContext = scratch.getContext('2d', { alpha: false });
-		if (!scratchContext) throw new Error('Study PDF: could not create a page drawing context.');
+		if (!scratchContext) throw new Error('Inscribe PDF: could not create a page drawing context.');
 		const sx = width / size.width;
 		const sy = height / size.height;
 		await updatedPage.render(pageView._getRenderingContext(scratchContext, [sx, 0, 0, sy, 0, 0])).promise;
 		if (!isCurrent() || pageView.canvas !== canvas || pageView.viewport !== viewport ||
 			canvas.width !== width || canvas.height !== height || (parent && canvas.parentNode !== parent)) {
-			throw new Error('Study PDF: the page changed while its annotations were being drawn.');
+			throw new Error('Inscribe PDF: the page changed while its annotations were being drawn.');
 		}
 		copyRaster(scratch);
 	} finally {
@@ -118,7 +118,7 @@ export async function refreshPageAnnotationLayer(
 	const builder = pageView.annotationLayer;
 	if (!builder) return; // An unrendered page will use the new page proxy when it is drawn.
 	if (!pageView.viewport || typeof builder.render !== 'function' || typeof builder.cancel !== 'function') {
-		throw new Error('Study PDF: this Obsidian PDF viewer cannot refresh one page safely.');
+		throw new Error('Inscribe PDF: this Obsidian PDF viewer cannot refresh one page safely.');
 	}
 
 	const oldLayer = builder.div;
@@ -136,7 +136,7 @@ export async function refreshPageAnnotationLayer(
 	// render() assigns div asynchronously; TypeScript cannot track that mutation.
 	const refreshedLayer = builder.div as PdfAnnotationLayerBuilderLike['div'];
 	if (!refreshedLayer || (layerParent && refreshedLayer.parentNode !== layerParent)) {
-		throw new Error('Study PDF: the refreshed PDF annotation layer was not attached to its page.');
+		throw new Error('Inscribe PDF: the refreshed PDF annotation layer was not attached to its page.');
 	}
 	// PDFPageView's onAppend callback replaces its previous layer element. Keep
 	// that element attached until render() calls it, or replaceWith() does nothing.
@@ -156,7 +156,7 @@ export function shouldSuppressPdfViewReload(options: {
 
 export async function fingerprintPdfBytes(bytes: Uint8Array): Promise<string> {
 	const subtle = globalThis.crypto?.subtle;
-	if (!subtle) throw new Error('Study PDF: this environment cannot verify the saved PDF bytes.');
+	if (!subtle) throw new Error('Inscribe PDF: this environment cannot verify the saved PDF bytes.');
 	const exactBytes = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const digest = await subtle.digest('SHA-256', exactBytes as BufferSource);
 	return Array.from(new Uint8Array(digest), (value) => value.toString(16).padStart(2, '0')).join('');

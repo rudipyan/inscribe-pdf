@@ -6,7 +6,8 @@ import {
 	verifyIncrementalTail,
 	type AddHighlightOptions,
 } from '../src/annotate';
-import { PdfSessionManager, type SessionFileLike } from '../src/pdf-working-session';
+import { PdfSessionManager, type PdfSaveStatus, type SessionFileLike } from '../src/pdf-working-session';
+import { fingerprintPdfBytes } from '../src/pdf-in-place';
 import { loadPdfjsDoc, makeFixturePdfBytes } from './helpers/pdf-fixture';
 
 const YELLOW = { r: 1, g: 1, b: 0 };
@@ -32,6 +33,7 @@ function createHarness(initialBytes: Uint8Array, options?: { debounceMs?: number
 	const visualSyncs: { flushRevision: number; pages: number[] }[] = [];
 	const dropped: string[] = [];
 	const historyEvents: string[] = [];
+	const saveStatuses: PdfSaveStatus[] = [];
 
 	const readBinary = vi.fn(async () => new Uint8Array(diskBytes));
 	const writeBinary = vi.fn(async (_f: SessionFileLike, bytes: Uint8Array) => {
@@ -41,13 +43,15 @@ function createHarness(initialBytes: Uint8Array, options?: { debounceMs?: number
 		file.stat.size = diskBytes.byteLength;
 	});
 
-	const manager = new PdfSessionManager(
+	let manager!: PdfSessionManager<SessionFileLike>;
+	manager = new PdfSessionManager(
 		{
 			readBinary,
 			writeBinary,
 			isFileCurrent: () => current,
 			onExternalConflict: (_f, _path, reason) => { conflicts.push(reason); },
 			onHistoryChanged: (_f, path) => { historyEvents.push(path); },
+			onSaveStatusChanged: (_f, path) => { saveStatuses.push(manager.getSaveStatus(path).status); },
 			onSessionDropped: (_f, path) => { dropped.push(path); },
 			onVisualSynced: (_f, _path, flushRevision, pages) => { visualSyncs.push({ flushRevision, pages }); },
 		},
@@ -64,6 +68,7 @@ function createHarness(initialBytes: Uint8Array, options?: { debounceMs?: number
 		visualSyncs,
 		dropped,
 		historyEvents,
+		saveStatuses,
 		diskBytes: () => diskBytes,
 		setDiskBytes: (bytes: Uint8Array) => {
 			diskBytes = new Uint8Array(bytes);
@@ -586,6 +591,49 @@ describe('PdfSessionManager incremental saves, batching, conflicts, and undo/red
 		expect(index.get(0) ?? []).toHaveLength(1);
 		expect(h.dropped).toEqual([]);
 		expect(h.manager.historyStatus(h.file, h.file.path)).toEqual({ canUndo: true, canRedo: false });
+		h.manager.disposeAll();
+	});
+
+	it('tracks save status transitions across dirty edits, write failure, retry, and success', async () => {
+		const baseBytes = await makeFixturePdfBytes();
+		const h = createHarness(baseBytes, { debounceMs: 5000, maxWaitMs: 10000 });
+		expect(h.manager.getSaveStatus(h.file.path)).toEqual({ status: 'idle' });
+
+		await h.manager.mutate(h.file, { kind: 'add-highlights', optionsList: [makeHighlight(0, 220, YELLOW)] });
+		expect(h.manager.getSaveStatus(h.file.path)).toEqual({ status: 'saving' });
+
+		h.writeBinary.mockRejectedValueOnce(new Error('disk full'));
+		await expect(h.manager.flushNow(h.file.path)).rejects.toThrow('disk full');
+		expect(h.manager.getSaveStatus(h.file.path)).toEqual({ status: 'error', errorMessage: 'disk full' });
+
+		// Retry succeeds cleanly and transitions saving -> idle.
+		await h.manager.flushNow(h.file.path);
+		expect(h.manager.getSaveStatus(h.file.path)).toEqual({ status: 'idle' });
+		expect(h.saveStatuses).toEqual(['saving', 'saving', 'error', 'saving', 'idle']);
+		h.manager.disposeAll();
+	});
+
+	it('extracts stored quotes and annotatedPageIndexes directly from a warm clean session', async () => {
+		const doc = await PDFDocument.create();
+		doc.addPage([400, 300]);
+		doc.addPage([400, 300]);
+		const baseBytes = await doc.save({ useObjectStreams: false });
+		const h = createHarness(baseBytes, { debounceMs: 5000, maxWaitMs: 10000 });
+
+		await h.manager.mutate(h.file, { kind: 'add-highlights', optionsList: [makeHighlight(0, 220, YELLOW, 'important quote')] });
+		const preFlushFp = await fingerprintPdfBytes(h.diskBytes());
+		// Session is still dirty -> must return null instead of stale disk match.
+		expect(await h.manager.getStoredQuotesForFingerprint(h.file.path, preFlushFp)).toBeNull();
+
+		await h.manager.flushNow(h.file.path);
+		const flushedFp = await fingerprintPdfBytes(h.diskBytes());
+		expect(await h.manager.getStoredQuotesForFingerprint(h.file.path, '0'.repeat(64))).toBeNull();
+
+		const stored = await h.manager.getStoredQuotesForFingerprint(h.file.path, flushedFp);
+		expect(stored).not.toBeNull();
+		expect(stored!.annotatedPageIndexes).toEqual(new Set([0]));
+		const pageZeroQuotes = Array.from(stored!.byAnnotationId.get(0)?.values() ?? []);
+		expect(pageZeroQuotes).toEqual([{ quote: 'important quote', isRegion: false }]);
 		h.manager.disposeAll();
 	});
 });
